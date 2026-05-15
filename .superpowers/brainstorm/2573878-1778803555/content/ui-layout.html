@@ -1,0 +1,118 @@
+<h2>Widget UI 布局设计</h2>
+<p class="subtitle">顶栏 pill + popout 弹层布局。点击你偏好的设计方向。</p>
+
+<div class="section">
+  <h3>① 顶栏 Bar Pill（水平）</h3>
+  <div class="mockup">
+    <div class="mockup-header">Dankbar 顶栏预览</div>
+    <div class="mockup-body" style="background:#1e1e2e;padding:8px 0;display:flex;align-items:center;gap:0;font-family:system-ui;">
+      <!-- Simulated bar -->
+      <div style="padding:0 12px;color:#cdd6f4;font-size:13px;opacity:0.6">󰣇</div>
+      <div style="padding:0 8px;color:#cdd6f4;font-size:13px;opacity:0.6">1 · 2 · 3</div>
+      <div style="flex:1"></div>
+      <!-- DeepSeek pill -->
+      <div style="background:#313244;border-radius:8px;padding:4px 12px;display:flex;align-items:center;gap:8px;margin:0 4px;">
+        <span style="color:#89dceb;font-size:13px;">⚖</span>
+        <span style="color:#cdd6f4;font-size:12px;font-weight:500;">¥ 12.50</span>
+        <span style="color:#585b70;font-size:12px;">|</span>
+        <span style="color:#a6e3a1;font-size:12px;">1.2M tok</span>
+      </div>
+      <div style="flex:1"></div>
+      <div style="padding:0 12px;color:#cdd6f4;font-size:13px;opacity:0.6">08:27</div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>② Popout 弹层内容</h3>
+  <div class="mockup">
+    <div class="mockup-header">点击 pill 后弹出的面板（宽 400px）</div>
+    <div class="mockup-body" style="background:#1e1e2e;padding:16px;font-family:system-ui;color:#cdd6f4;display:flex;flex-direction:column;gap:12px;max-width:400px;">
+
+      <!-- Header -->
+      <div style="font-size:16px;font-weight:700;color:#cdd6f4">DeepSeek 用量</div>
+
+      <!-- Auth warning (visible when expired) -->
+      <div style="background:#45475a;border-left:3px solid #f38ba8;border-radius:6px;padding:8px 12px;font-size:12px;color:#f38ba8;">
+        ⚠ 会话已过期，请重新登录
+      </div>
+
+      <!-- Login button -->
+      <div style="background:#313244;border:1px solid #45475a;border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px;cursor:pointer;">
+        <span style="color:#89b4fa;font-size:16px;">🔑</span>
+        <div>
+          <div style="font-size:13px;font-weight:600;color:#cdd6f4">重新登录 Platform</div>
+          <div style="font-size:11px;color:#6c7086">Playwright Chromium 自动等待登录成功</div>
+        </div>
+      </div>
+
+      <!-- Balance card -->
+      <div style="background:#313244;border-radius:8px;padding:12px 14px;">
+        <div style="font-size:11px;color:#6c7086;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">API 余额</div>
+        <div style="font-size:22px;font-weight:700;color:#a6e3a1">¥ 12.50</div>
+        <div style="font-size:11px;color:#6c7086;margin-top:2px">CNY · 可用</div>
+      </div>
+
+      <!-- Usage summary -->
+      <div style="background:#313244;border-radius:8px;padding:12px 14px;">
+        <div style="font-size:11px;color:#6c7086;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">本月用量（2026-05 UTC）</div>
+        <div style="display:flex;gap:16px;">
+          <div>
+            <div style="font-size:18px;font-weight:700;color:#89dceb">842K</div>
+            <div style="font-size:11px;color:#6c7086">输入 tokens</div>
+          </div>
+          <div>
+            <div style="font-size:18px;font-weight:700;color:#cba6f7">358K</div>
+            <div style="font-size:11px;color:#6c7086">输出 tokens</div>
+          </div>
+          <div>
+            <div style="font-size:18px;font-weight:700;color:#f9e2af">¥ 2.34</div>
+            <div style="font-size:11px;color:#6c7086">本月花费</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Trend chart -->
+      <div style="background:#313244;border-radius:8px;padding:12px 14px;">
+        <div style="font-size:11px;color:#6c7086;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">近 3 月 Token 趋势</div>
+        <svg width="100%" height="80" viewBox="0 0 360 80">
+          <!-- Grid lines -->
+          <line x1="0" y1="60" x2="360" y2="60" stroke="#45475a" stroke-width="0.5"/>
+          <line x1="0" y1="30" x2="360" y2="30" stroke="#45475a" stroke-width="0.5"/>
+          <!-- Input tokens line (teal) -->
+          <polyline points="30,55 150,40 300,20" fill="none" stroke="#89dceb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <!-- Output tokens line (purple) -->
+          <polyline points="30,65 150,58 300,48" fill="none" stroke="#cba6f7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <!-- Area fill input -->
+          <polygon points="30,55 150,40 300,20 300,70 30,70" fill="#89dceb" fill-opacity="0.08"/>
+          <!-- Dots -->
+          <circle cx="30" cy="55" r="3" fill="#89dceb"/>
+          <circle cx="150" cy="40" r="3" fill="#89dceb"/>
+          <circle cx="300" cy="20" r="3" fill="#89dceb"/>
+          <circle cx="30" cy="65" r="3" fill="#cba6f7"/>
+          <circle cx="150" cy="58" r="3" fill="#cba6f7"/>
+          <circle cx="300" cy="48" r="3" fill="#cba6f7"/>
+          <!-- X labels -->
+          <text x="30" y="76" text-anchor="middle" fill="#6c7086" font-size="9">2026-03</text>
+          <text x="150" y="76" text-anchor="middle" fill="#6c7086" font-size="9">2026-04</text>
+          <text x="300" y="76" text-anchor="middle" fill="#6c7086" font-size="9">2026-05</text>
+        </svg>
+        <div style="display:flex;gap:12px;margin-top:4px;">
+          <div style="display:flex;align-items:center;gap:4px;font-size:11px;color:#6c7086"><span style="width:10px;height:2px;background:#89dceb;display:inline-block;border-radius:1px"></span>输入</div>
+          <div style="display:flex;align-items:center;gap:4px;font-size:11px;color:#6c7086"><span style="width:10px;height:2px;background:#cba6f7;display:inline-block;border-radius:1px"></span>输出</div>
+        </div>
+      </div>
+
+      <!-- Quick links + refresh -->
+      <div style="display:flex;gap:8px;">
+        <div style="flex:1;background:#89b4fa;border-radius:6px;padding:8px;text-align:center;font-size:12px;color:#1e1e2e;font-weight:600;">Usage</div>
+        <div style="flex:1;background:#313244;border-radius:6px;padding:8px;text-align:center;font-size:12px;color:#cdd6f4;">监控</div>
+        <div style="flex:1;background:#313244;border-radius:6px;padding:8px;text-align:center;font-size:12px;color:#cdd6f4;">API Keys</div>
+        <div style="flex:1;background:#313244;border-radius:6px;padding:8px;text-align:center;font-size:12px;color:#cdd6f4;">↻ 刷新</div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:16px">这个布局整体合适吗？有想调整的细节请告诉我。</p>
