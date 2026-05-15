@@ -1,0 +1,15 @@
+{
+  "id": "deepseekWidget",
+  "name": "DeepSeek Usage",
+  "description": "API balance & platform token usage, Cookie auto-login",
+  "version": "1.0.1",
+  "author": "gylove1994",
+  "type": "widget",
+  "capabilities": ["dankbar-widget"],
+  "component": "./DeepSeekWidget.qml",
+  "settings": "./DeepSeekSettings.qml",
+  "icon": "account_balance",
+  "permissions": ["settings_read", "settings_write", "network", "process"],
+  "requires": ["python3"],
+  "requires_dms": ">=0.1.0"
+}

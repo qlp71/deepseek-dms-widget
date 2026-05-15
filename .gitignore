@@ -1,1 +1,21 @@
+# Internal
 .superpowers/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# Sensitive user data
+cookie.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
