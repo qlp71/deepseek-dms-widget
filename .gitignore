@@ -12,7 +12,7 @@ venv/
 
 # Sensitive user data
 cookie.txt
-
+.claude
 # OS
 .DS_Store
 Thumbs.db

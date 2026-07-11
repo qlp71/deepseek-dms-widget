@@ -13,7 +13,7 @@ PluginComponent {
     readonly property string _fetchScript: _pluginDir + "scripts/fetch.py"
     readonly property string _loginScript: _pluginDir + "scripts/login.py"
     readonly property string _cookieFile:  _pluginDir + "cookie.txt"
-    readonly property string _python:      _pluginDir + ".venv/bin/python"
+    readonly property string _python: "python"
     // Unique command ID per instance to avoid debounce callback collisions
     readonly property string _cmdId: "deepseekWidget_" + Math.random().toString(36).slice(2, 10)
 
@@ -62,8 +62,15 @@ PluginComponent {
 
     // History (array of {year,month,inputTokens,outputTokens,cost})
     property var history: pluginData.history || []
-    // Daily (array of {day, inputTokens, outputTokens})
+    // Daily (array of {day, inputTokens, outputTokens, cost, models})
     property var daily: []
+    // Cached daily data per month: {"2026-7": [...], "2026-6": [...]}
+    property var dailyCache: pluginData.dailyCache || {}
+
+    // Chart state
+    property string chartMode: "cost"     // "cost" | "tokens"
+    property int viewYear: 0
+    property int viewMonth: 0
 
     // ── Utility functions ─────────────────────────────────────
     function _fmtTokens(n) {
@@ -79,6 +86,78 @@ PluginComponent {
         const v = parseFloat(s)
         if (!isFinite(v)) return "—"
         return "¥ " + v.toFixed(2)
+    }
+
+    // ── Today's cost ───────────────────────────────────────────
+    function _getTodayCost() {
+        const dl = daily || []
+        const now = new Date()
+        const today = now.getDate()
+        for (const d of dl) {
+            if (d.day === today && d.cost != null) return _fmtCurrency(d.cost)
+        }
+        return "—"
+    }
+
+    // ── Chart data helpers ──────────────────────────────────────
+    function _monthKey(y, m) { return y + "-" + m }
+
+    function _getChartData() {
+        const key = _monthKey(viewYear, viewMonth)
+        return dailyCache[key] || []
+    }
+
+    function _canGoPrev() {
+        const keys = Object.keys(dailyCache).sort()
+        const key = _monthKey(viewYear, viewMonth)
+        return keys.indexOf(key) > 0
+    }
+
+    function _canGoNext() {
+        const keys = Object.keys(dailyCache).sort()
+        const key = _monthKey(viewYear, viewMonth)
+        const idx = keys.indexOf(key)
+        return idx >= 0 && idx < keys.length - 1
+    }
+
+    function _goPrevMonth() {
+        const keys = Object.keys(dailyCache).sort()
+        const key = _monthKey(viewYear, viewMonth)
+        const idx = keys.indexOf(key)
+        if (idx > 0) {
+            const [y, m] = keys[idx - 1].split("-")
+            viewYear = parseInt(y); viewMonth = parseInt(m)
+        }
+    }
+
+    function _goNextMonth() {
+        const keys = Object.keys(dailyCache).sort()
+        const key = _monthKey(viewYear, viewMonth)
+        const idx = keys.indexOf(key)
+        if (idx >= 0 && idx < keys.length - 1) {
+            const [y, m] = keys[idx + 1].split("-")
+            viewYear = parseInt(y); viewMonth = parseInt(m)
+        }
+    }
+
+    function _isCurrentMonth() {
+        return viewYear === curYear && viewMonth === curMonth
+    }
+
+    function _getMonthTotal() {
+        const data = _getChartData()
+        if (!data || data.length === 0) return "—"
+        let total = 0
+        if (chartMode === "cost") {
+            for (const d of data) total += d.cost || 0
+            return _fmtCurrency(total)
+        } else {
+            for (const d of data) {
+                const models = (d.models || []).filter(m => !m.model.toLowerCase().includes("chat"))
+                for (const m of models) total += (m.inputTokens || 0) + (m.outputTokens || 0)
+            }
+            return _fmtTokens(total)
+        }
     }
 
     // ── Parse fetch.py output ─────────────────────────────────
@@ -135,6 +214,22 @@ PluginComponent {
         // Daily breakdown
         if (o.daily && Array.isArray(o.daily)) {
             root.daily = o.daily
+        }
+
+        // Merge dailyByMonth into cache
+        if (o.dailyByMonth && typeof o.dailyByMonth === "object") {
+            const cache = Object.assign({}, pluginData.dailyCache || {})
+            for (const key of Object.keys(o.dailyByMonth)) {
+                cache[key] = o.dailyByMonth[key]
+            }
+            root.dailyCache = cache
+            savePluginData({ dailyCache: cache, history: root.history })
+        }
+
+        // Initialize viewYear/viewMonth from current data
+        if (root.viewYear === 0 && root.curYear > 0) {
+            root.viewYear = root.curYear
+            root.viewMonth = root.curMonth
         }
 
         const now = new Date()
@@ -209,6 +304,7 @@ PluginComponent {
             spacing: Theme.spacingS
 
             // DeepSeek Logo (Canvas)
+            /*
             Canvas {
                 width: 16; height: 16
                 onPaint: {
@@ -242,6 +338,7 @@ PluginComponent {
                     ctx.stroke()
                 }
             }
+            */
 
             // Not-logged-in state
             StyledText {
@@ -266,10 +363,10 @@ PluginComponent {
                 color: Theme.surfaceVariantText
             }
 
-            // Monthly usage
+            // Today's cost
             StyledText {
                 visible: root.cookieStatus !== "missing"
-                text: root.fetchRunning ? "…" : root.monthlyTokenUsage
+                text: root.fetchRunning ? "…" : root._getTodayCost()
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceText
             }
@@ -303,7 +400,7 @@ PluginComponent {
                     StyledText {
                         id: notLoginText
                         anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; margins: Theme.spacingS }
-                        text: tr.notLoggedInHint || "Click Re-login to get Cookie"
+                        text: tr.notLoggedInHint || "Click the key icon to login"
                         font.pixelSize: Theme.fontSizeSmall
                         color: Theme.primary
                         wrapMode: Text.WordWrap
@@ -327,50 +424,6 @@ PluginComponent {
                         font.pixelSize: Theme.fontSizeSmall
                         color: Theme.error
                         wrapMode: Text.WordWrap
-                    }
-                }
-
-                // Login button
-                StyledRect {
-                    width: parent.width
-                    height: 44
-                    radius: Theme.cornerRadius
-                    color: loginArea.containsMouse ? Theme.surfaceContainer : Theme.surfaceContainerHigh
-                    border.width: 1
-                    border.color: Theme.outline
-                    opacity: root.loginRunning ? 0.6 : 1
-
-                    Row {
-                        anchors { fill: parent; margins: Theme.spacingS }
-                        spacing: Theme.spacingS
-
-                        DankIcon {
-                            name: "vpn_key"
-                            size: Theme.fontSizeMedium
-                            color: Theme.primary
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-
-                        StyledText {
-                            width: parent.width - 32 - Theme.spacingS * 3
-                            text: root.loginRunning
-                                ? (tr.loginRunning || "Browser opened…")
-                                : (tr.relogin || "Re-login Platform")
-                            font.pixelSize: Theme.fontSizeSmall
-                            font.weight: Font.Medium
-                            color: Theme.surfaceText
-                            anchors.verticalCenter: parent.verticalCenter
-                            wrapMode: Text.WordWrap
-                        }
-                    }
-
-                    MouseArea {
-                        id: loginArea
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: !root.loginRunning
-                        onClicked: root.launchLogin()
                     }
                 }
 
@@ -435,19 +488,20 @@ PluginComponent {
                             font.pixelSize: Theme.fontSizeSmall - 1
                             color: Theme.surfaceVariantText
                         }
-
+                        /*
                         StyledText {
                             text: "K = Thousand  M = Million  B = Billion"
                             font.pixelSize: Theme.fontSizeSmall - 2
                             color: Qt.rgba(Theme.surfaceVariantText.r, Theme.surfaceVariantText.g, Theme.surfaceVariantText.b, 0.5)
                         }
+                        */
                     }
                 }
 
                 // Trend chart
                 StyledRect {
                     width: parent.width
-                    height: 180
+                    height: 240
                     radius: Theme.cornerRadius
                     color: Theme.surfaceContainerHigh
 
@@ -455,22 +509,80 @@ PluginComponent {
                         anchors { fill: parent; margins: Theme.spacingM }
                         spacing: Theme.spacingXS
 
-                        StyledText {
-                            text: root.curYear > 0
-                                ? (tr.dailyTokenTrend || "Daily Token Usage (This Month)") + "  " + root.curYear + "-" + (root.curMonth < 10 ? "0" + root.curMonth : root.curMonth)
-                                : (tr.dailyTokenTrend || "Daily Token Usage (This Month)")
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.surfaceVariantText
+                        Item {
+                            width: parent.width; height: 28
+
+                            StyledText {
+                                id: chartTitle
+                                text: {
+                                    const m = root.viewMonth < 10 ? "0" + root.viewMonth : root.viewMonth
+                                    const suffix = root._isCurrentMonth() ? " (" + (root.tr.currentMonth || "Current") + ")" : ""
+                                    return (root.tr.dailyChart || "Daily Usage") + "  " + root.viewYear + "-" + m + suffix
+                                }
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.surfaceVariantText
+                                anchors { left: parent.left; verticalCenter: parent.verticalCenter }
+                            }
+
+                            StyledText {
+                                text: "  ·  " + root._getMonthTotal()
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.weight: Font.Bold
+                                color: root.chartMode === "cost" ? "#f9e2af" : Theme.surfaceText
+                                anchors { left: chartTitle.right; verticalCenter: parent.verticalCenter }
+                            }
+
+                            DankButton {
+                                width: 28; height: 28
+                                text: "¥"
+                                iconName: ""
+                                backgroundColor: "transparent"
+                                textColor: "#f9e2af"
+                                anchors { right: loginBtn.left; rightMargin: 2; verticalCenter: parent.verticalCenter }
+                                onClicked: Proc.runCommand(
+                                    _cmdId + ".topup",
+                                    ["sh", "-c", "xdg-open https://platform.deepseek.com/top_up"],
+                                    function() {}, 0, 5000
+                                )
+                            }
+
+                            DankButton {
+                                id: loginBtn
+                                width: 28; height: 28
+                                text: ""
+                                iconName: "vpn_key"
+                                backgroundColor: "transparent"
+                                textColor: root.cookieStatus === "missing" ? Theme.error
+                                         : root.cookieStatus === "expired" ? Theme.error
+                                         : Theme.surfaceVariantText
+                                opacity: root.loginRunning ? 0.4 : 1
+                                anchors { right: refreshBtn.left; rightMargin: 2; verticalCenter: parent.verticalCenter }
+                                onClicked: root.launchLogin()
+                            }
+
+                            DankButton {
+                                id: refreshBtn
+                                width: 28; height: 28
+                                text: ""
+                                iconName: "refresh"
+                                backgroundColor: "transparent"
+                                textColor: Theme.surfaceVariantText
+                                opacity: root.fetchRunning ? 0.4 : 1
+                                anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                                onClicked: root.refreshAll()
+                            }
                         }
 
                         Canvas {
                             id: trendCanvas
                             width: parent.width
-                            height: 130
+                            height: 170
 
-                            property var chartData: root.daily
+                            property var chartData: root._getChartData()
+                            property string _mode: root.chartMode
 
                             onChartDataChanged: requestPaint()
+                            on_ModeChanged: requestPaint()
                             onWidthChanged: requestPaint()
 
                             onPaint: {
@@ -480,26 +592,37 @@ PluginComponent {
                                 const data = chartData
                                 if (!data || data.length === 0) {
                                     ctx.fillStyle = Qt.rgba(1,1,1,0.2)
-                                    ctx.font = "10px sans-serif"
+                                    ctx.font = "12px sans-serif"
                                     ctx.textAlign = "center"
                                     ctx.fillText(root.tr.noData || "No data", width / 2, height / 2)
                                     return
                                 }
 
-                                const PAD_L = 40, PAD_R = 6, PAD_T = 8, PAD_B = 20
+                                const isTokens = root.chartMode === "tokens"
+                                const PAD_L = 44, PAD_R = 6, PAD_T = 14, PAD_B = 20
                                 const chartW = width - PAD_L - PAD_R
                                 const chartH = height - PAD_T - PAD_B
                                 const n = data.length
                                 const gap  = chartW / n
-                                const barW = Math.max(2, Math.min(gap * 0.7, 18))
 
-                                let maxTotal = 1
-                                for (const d of data) {
-                                    const t = (d.inputTokens || 0) + (d.outputTokens || 0)
-                                    if (t > maxTotal) maxTotal = t
+                                // ── Compute max value ────────────────────
+                                let maxVal = 0.001
+                                if (isTokens) {
+                                    for (const d of data) {
+                                        const models = d.models || []
+                                        for (const m of models) {
+                                            const t = (m.inputTokens || 0) + (m.outputTokens || 0)
+                                            if (t > maxVal) maxVal = t
+                                        }
+                                    }
+                                } else {
+                                    for (const d of data) {
+                                        const c = d.cost || 0
+                                        if (c > maxVal) maxVal = c
+                                    }
                                 }
 
-                                // grid lines
+                                // ── Grid lines ──────────────────────────
                                 ctx.strokeStyle = Qt.rgba(1,1,1,0.07)
                                 ctx.lineWidth = 0.5
                                 for (let i = 0; i <= 4; i++) {
@@ -507,42 +630,113 @@ PluginComponent {
                                     ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(width - PAD_R, y); ctx.stroke()
                                 }
 
-                                // y-axis labels
+                                // ── Y-axis labels ────────────────────────
                                 ctx.fillStyle = Qt.rgba(1,1,1,0.35)
-                                ctx.font = "9px sans-serif"
+                                ctx.font = "11px sans-serif"
                                 ctx.textAlign = "right"
                                 for (let i = 0; i <= 4; i++) {
-                                    const v = maxTotal * i / 4
-                                    const lbl = v >= 1e9 ? (v/1e9).toFixed(1)+"B" : v >= 1e6 ? (v/1e6).toFixed(1)+"M" : v >= 1e3 ? (v/1e3).toFixed(0)+"K" : String(Math.round(v))
+                                    const v = maxVal * i / 4
+                                    let lbl
+                                    if (isTokens) {
+                                        lbl = v >= 1e9 ? (v/1e9).toFixed(1)+"B" : v >= 1e6 ? (v/1e6).toFixed(1)+"M" : v >= 1e3 ? (v/1e3).toFixed(0)+"K" : String(Math.round(v))
+                                    } else {
+                                        lbl = "¥" + v.toFixed(2)
+                                    }
                                     ctx.fillText(lbl, PAD_L - 3, PAD_T + chartH * (1 - i / 4) + 3)
                                 }
 
-                                // bars + x labels
-                                for (let i = 0; i < n; i++) {
-                                    const d = data[i]
-                                    const cx = PAD_L + gap * i + gap / 2
-                                    const inpH  = chartH * ((d.inputTokens  || 0) / maxTotal)
-                                    const outH  = chartH * ((d.outputTokens || 0) / maxTotal)
-                                    const totalH = inpH + outH
-                                    const barX  = cx - barW / 2
-                                    const baseY = PAD_T + chartH
+                                const baseY = PAD_T + chartH
 
-                                    // output (bottom)
-                                    ctx.globalAlpha = 0.85
-                                    ctx.fillStyle = "#cba6f7"
-                                    ctx.fillRect(barX, baseY - outH, barW, outH)
+                                if (!isTokens) {
+                                    // ── COST MODE: single bar per day ────
+                                    const barW = Math.max(2, Math.min(gap * 0.7, 18))
+                                    for (let i = 0; i < n; i++) {
+                                        const d = data[i]
+                                        if (d.day == null) continue
+                                        const cx  = PAD_L + gap * i + gap / 2
+                                        const barH = chartH * ((d.cost || 0) / maxVal)
+                                        const barX = cx - barW / 2
 
-                                    // input (top)
-                                    ctx.fillStyle = "#89dceb"
-                                    ctx.fillRect(barX, baseY - totalH, barW, inpH)
-                                    ctx.globalAlpha = 1.0
+                                        ctx.globalAlpha = 0.85
+                                        ctx.fillStyle = "#f9e2af"
+                                        ctx.fillRect(barX, baseY - barH, barW, barH)
+                                        ctx.globalAlpha = 1.0
 
-                                    // x label: show only every 5 days and day 1
-                                    if (d.day === 1 || d.day % 5 === 0) {
-                                        ctx.fillStyle = Qt.rgba(1,1,1,0.4)
-                                        ctx.textAlign = "center"
-                                        ctx.font = "8px sans-serif"
-                                        ctx.fillText(String(d.day), cx, height - 3)
+                                        if ((d.cost || 0) > 0 && barH > 6) {
+                                            ctx.fillStyle = Qt.rgba(1,1,1,0.6)
+                                            ctx.textAlign = "center"
+                                            ctx.font = "11px sans-serif"
+                                            ctx.fillText((d.cost || 0).toFixed(2), cx, baseY - barH - 2)
+                                        }
+                                        if (d.day === 1 || d.day % 5 === 0) {
+                                            ctx.fillStyle = Qt.rgba(1,1,1,0.4)
+                                            ctx.textAlign = "center"
+                                            ctx.font = "10px sans-serif"
+                                            ctx.fillText(String(d.day), cx, height - 3)
+                                        }
+                                    }
+                                } else {
+                                    // ── TOKENS MODE: per-model stacked bars ──
+                                    // Color pairs: [input, output] per model
+                                    const MODEL_COLORS = [
+                                        ["#5b9bd5", "#a855f7"],  // model 0: medium blue + purple
+                                        ["#38bdf8", "#e879f9"],  // model 1: light blue + pink-purple
+                                        ["#22d3bb", "#f97316"],  // model 2: teal + orange (fallback)
+                                    ]
+
+                                    for (let i = 0; i < n; i++) {
+                                        const d = data[i]
+                                        if (d.day == null) continue
+                                        const models = (d.models || []).filter(m => !m.model.toLowerCase().includes("chat"))
+                                        if (models.length === 0) continue
+
+                                        const numModels = Math.min(models.length, 3)
+                                        const groupW = Math.min(gap * 0.8, 30)
+                                        const modelW = Math.max(2, groupW / numModels - 2)
+                                        const groupX = PAD_L + gap * i + gap / 2 - groupW / 2
+
+                                        for (let mi = 0; mi < numModels; mi++) {
+                                            const m = models[mi]
+                                            const inp = m.inputTokens || 0
+                                            const out = m.outputTokens || 0
+                                            const total = inp + out
+                                            if (total === 0) continue
+
+                                            const colors = MODEL_COLORS[mi] || MODEL_COLORS[0]
+                                            const mx = groupX + mi * (modelW + 2)
+                                            const outH = chartH * (out / maxVal)
+                                            const inpH = chartH * (inp / maxVal)
+                                            const totalH = outH + inpH
+
+                                            ctx.globalAlpha = 0.85
+                                            // output (bottom)
+                                            ctx.fillStyle = colors[1]
+                                            ctx.fillRect(mx, baseY - outH, modelW, outH)
+                                            // input (top)
+                                            ctx.fillStyle = colors[0]
+                                            ctx.fillRect(mx, baseY - totalH, modelW, inpH)
+                                            ctx.globalAlpha = 1.0
+
+                                            // Value label
+                                            if (totalH > 6) {
+                                                ctx.fillStyle = Qt.rgba(1,1,1,0.55)
+                                                ctx.textAlign = "center"
+                                                ctx.font = "10px sans-serif"
+                                                ctx.fillText(
+                                                    total >= 1e6 ? (total/1e6).toFixed(1)+"M" : total >= 1e3 ? (total/1e3).toFixed(1)+"K" : String(total),
+                                                    mx + modelW / 2,
+                                                    baseY - totalH - 2
+                                                )
+                                            }
+                                        }
+
+                                        // x label
+                                        if (d.day === 1 || d.day % 5 === 0) {
+                                            ctx.fillStyle = Qt.rgba(1,1,1,0.4)
+                                            ctx.textAlign = "center"
+                                            ctx.font = "10px sans-serif"
+                                            ctx.fillText(String(d.day), PAD_L + gap * i + gap / 2, height - 3)
+                                        }
                                     }
                                 }
                             }
@@ -551,16 +745,40 @@ PluginComponent {
                         // Legend
                         Row {
                             spacing: Theme.spacingM
+                            visible: root.chartMode === "tokens"
 
-                            Row {
-                                spacing: 4
-                                Rectangle { width: 10; height: 8; radius: 1; color: "#89dceb"; opacity: 0.85; anchors.verticalCenter: parent.verticalCenter }
-                                StyledText { text: tr.inputTokens || "Input"; font.pixelSize: Theme.fontSizeSmall - 1; color: Theme.surfaceVariantText }
+                            Repeater {
+                                model: {
+                                    const LEGEND_COLORS = [["#5b9bd5", "#a855f7"], ["#38bdf8", "#e879f9"], ["#22d3bb", "#f97316"]]
+                                    const data = root._getChartData()
+                                    if (!data || data.length === 0) return []
+                                    for (const d of data) {
+                                        const models = (d.models || []).filter(m => !m.model.toLowerCase().includes("chat"))
+                                        if (models.length > 0) {
+                                            return models.slice(0, 3).map((m, idx) => ({
+                                                name: m.model,
+                                                inColor: (LEGEND_COLORS[idx] || LEGEND_COLORS[0])[0],
+                                                outColor: (LEGEND_COLORS[idx] || LEGEND_COLORS[0])[1],
+                                            }))
+                                        }
+                                    }
+                                    return []
+                                }
+                                delegate: Column {
+                                    spacing: 2
+                                    Row {
+                                        spacing: 4
+                                        Rectangle { width: 10; height: 6; radius: 1; color: modelData.inColor; opacity: 0.85; anchors.verticalCenter: parent.verticalCenter }
+                                        Rectangle { width: 10; height: 6; radius: 1; color: modelData.outColor; opacity: 0.85; anchors.verticalCenter: parent.verticalCenter }
+                                        StyledText { text: modelData.name; font.pixelSize: Theme.fontSizeSmall - 1; color: Theme.surfaceVariantText }
+                                    }
+                                }
                             }
-                            Row {
-                                spacing: 4
-                                Rectangle { width: 10; height: 8; radius: 1; color: "#cba6f7"; opacity: 0.85; anchors.verticalCenter: parent.verticalCenter }
-                                StyledText { text: tr.outputTokens || "Output"; font.pixelSize: Theme.fontSizeSmall - 1; color: Theme.surfaceVariantText }
+                            StyledText {
+                                visible: root.chartMode !== "tokens"
+                                text: (tr.inputTokens || "Input") + " / " + (tr.outputTokens || "Output")
+                                font.pixelSize: Theme.fontSizeSmall - 1
+                                color: Theme.surfaceVariantText
                             }
                         }
                     }
@@ -571,32 +789,38 @@ PluginComponent {
                     width: parent.width
                     spacing: Theme.spacingS
 
-                    Repeater {
-                        model: [
-                            { label: tr.usagePage   || "Usage",    url: "https://platform.deepseek.com/usage"      },
-                            { label: tr.monitorPage || "Monitoring",      url: "https://console.deepseek.com/monitoring"  },
-                            { label: tr.apiKeysPage || "API Keys", url: "https://platform.deepseek.com/api_keys"   }
-                        ]
-                        delegate: StyledRect {
-                            width: (parent.width - Theme.spacingS * 2) / 3
-                            height: 34
-                            radius: Theme.cornerRadius
-                            color: linkArea.containsMouse ? Theme.surfaceContainer : Theme.surfaceContainerHigh
-                            StyledText { anchors.centerIn: parent; text: modelData.label; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceText }
-                            MouseArea { id: linkArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: Quickshell.execDetached(["xdg-open", modelData.url]) }
-                        }
+                    DankButton {
+                        width: (parent.width - Theme.spacingS * 3) / 4
+                        height: 34
+                        text: "◀"
+                        backgroundColor: Theme.surfaceContainerHigh
+                        textColor: root._canGoPrev() ? Theme.surfaceText : Theme.surfaceVariantText
+                        onClicked: { if (root._canGoPrev()) root._goPrevMonth() }
                     }
-                }
-
-                // Refresh button
-                StyledRect {
-                    width: parent.width
-                    height: 34
-                    radius: Theme.cornerRadius
-                    color: refreshArea.containsMouse ? Theme.primary : Theme.surfaceContainerHigh
-                    opacity: root.fetchRunning ? 0.6 : 1
-                    StyledText { anchors.centerIn: parent; text: root.fetchRunning ? "…" : (tr.refresh || "Refresh"); font.pixelSize: Theme.fontSizeSmall; color: refreshArea.containsMouse ? Theme.onPrimary : Theme.surfaceText }
-                    MouseArea { id: refreshArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; enabled: !root.fetchRunning; onClicked: root.refreshAll() }
+                    DankButton {
+                        width: (parent.width - Theme.spacingS * 3) / 4
+                        height: 34
+                        text: root.chartMode === "cost" ? "● Cost" : "Cost"
+                        backgroundColor: root.chartMode === "cost" ? Theme.primary : Theme.surfaceContainerHigh
+                        textColor: root.chartMode === "cost" ? Theme.onPrimary : Theme.surfaceText
+                        onClicked: { root.chartMode = "cost" }
+                    }
+                    DankButton {
+                        width: (parent.width - Theme.spacingS * 3) / 4
+                        height: 34
+                        text: root.chartMode === "tokens" ? "● Tokens" : "Tokens"
+                        backgroundColor: root.chartMode === "tokens" ? Theme.primary : Theme.surfaceContainerHigh
+                        textColor: root.chartMode === "tokens" ? Theme.onPrimary : Theme.surfaceText
+                        onClicked: { root.chartMode = "tokens" }
+                    }
+                    DankButton {
+                        width: (parent.width - Theme.spacingS * 3) / 4
+                        height: 34
+                        text: "▶"
+                        backgroundColor: Theme.surfaceContainerHigh
+                        textColor: root._canGoNext() ? Theme.surfaceText : Theme.surfaceVariantText
+                        onClicked: { if (root._canGoNext()) root._goNextMonth() }
+                    }
                 }
 
             } // contentCol

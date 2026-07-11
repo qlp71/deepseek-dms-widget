@@ -93,14 +93,76 @@ def parse_total_cost(biz_data_list: list) -> str:
     return f"{total:.10f}" if total > 0 else "0"
 
 
-def parse_daily(body: str, cur_day: int) -> list[dict]:
-    """Parse group_by=day amount response into [{day, inputTokens, outputTokens}]."""
+def build_pricing_map(amount_body: str, cost_body: str) -> dict:
+    """Derive exact per-model, per-token-type pricing from monthly API responses.
+
+    Uses the ACTUAL cost and token counts reported by DeepSeek to compute
+    the price per token for each (model, token_type) combination.  This
+    automatically adapts to peak/off-peak pricing changes.
+
+    Returns {(model, token_type): price_per_token} (yuan per single token).
+    """
+    # ── Extract token counts from monthly amount response ──────
+    token_counts: dict[tuple[str, str], int] = {}
+    try:
+        a_o = json.loads(amount_body)
+        a_biz = (a_o.get("data") or {}).get("biz_data") or {}
+        for model_entry in a_biz.get("total", []):
+            model = model_entry.get("model", "unknown")
+            for u in model_entry.get("usage", []):
+                t = u.get("type", "")
+                amt = int(u.get("amount", 0))
+                if amt > 0:
+                    token_counts[(model, t)] = amt
+    except Exception:
+        pass
+
+    # ── Extract costs from monthly cost response ────────────────
+    cost_map: dict[tuple[str, str], float] = {}
+    try:
+        c_o = json.loads(cost_body)
+        c_biz = (c_o.get("data") or {}).get("biz_data") or {}
+        entries = c_biz if isinstance(c_biz, list) else [c_biz]
+        for entry in entries:
+            for model_entry in entry.get("total", []):
+                model = model_entry.get("model", "unknown")
+                for u in model_entry.get("usage", []):
+                    t = u.get("type", "")
+                    try:
+                        amt = float(u.get("amount", 0))
+                    except (ValueError, TypeError):
+                        amt = 0.0
+                    if amt > 0:
+                        cost_map[(model, t)] = cost_map.get((model, t), 0.0) + amt
+    except Exception:
+        pass
+
+    # ── Derive per-token pricing ────────────────────────────────
+    pricing: dict[tuple[str, str], float] = {}
+    for key, tokens in token_counts.items():
+        cost = cost_map.get(key, 0)
+        if tokens > 0 and cost > 0:
+            pricing[key] = cost / tokens
+
+    return pricing
+
+
+def parse_daily(body: str, cur_day: int, pricing_map: dict | None = None) -> list[dict]:
+    """Parse group_by=day amount response into [{day, inputTokens, outputTokens, cost}].
+
+    Cost is computed from per-token-type counts × the pricing map derived
+    from the official monthly cost/amount APIs, so it always matches what
+    the DeepSeek platform reports.
+    """
     try:
         o = json.loads(body)
         biz = (o.get("data") or {}).get("biz_data") or {}
         days_raw = biz.get("days", [])
     except Exception:
         return []
+
+    if pricing_map is None:
+        pricing_map = {}
 
     result = []
     for d in days_raw:
@@ -112,14 +174,116 @@ def parse_daily(body: str, cur_day: int) -> list[dict]:
         if day_num > cur_day:
             continue
         inp = out = 0
+        day_cost = 0.0
+        models = []  # per-model breakdown
         for model_entry in d.get("data", []):
+            model = model_entry.get("model", "unknown")
+            # Skip deprecated "chat" family models
+            if "chat" in model.lower():
+                continue
+            m_inp = 0
+            m_out = 0
+            m_cost = 0.0
             for u in model_entry.get("usage", []):
-                t, amt = u.get("type", ""), int(u.get("amount", 0))
-                if t in ("PROMPT_CACHE_HIT_TOKEN", "PROMPT_CACHE_MISS_TOKEN"):
-                    inp += amt
+                t = u.get("type", "")
+                amt = int(u.get("amount", 0))
+                if t in ("PROMPT_CACHE_HIT_TOKEN", "PROMPT_CACHE_MISS_TOKEN", "PROMPT_TOKEN"):
+                    m_inp += amt
                 elif t == "RESPONSE_TOKEN":
-                    out += amt
-        result.append({"day": day_num, "inputTokens": inp, "outputTokens": out})
+                    m_out += amt
+                # Look up exact per-token price from official data
+                price = pricing_map.get((model, t))
+                if price is not None and price > 0 and amt > 0:
+                    m_cost += amt * price
+            inp += m_inp
+            out += m_out
+            day_cost += m_cost
+            models.append({
+                "model": model,
+                "inputTokens": m_inp,
+                "outputTokens": m_out,
+                "cost": round(m_cost, 6),
+            })
+        result.append({
+            "day": day_num,
+            "inputTokens": inp,
+            "outputTokens": out,
+            "cost": round(day_cost, 6),
+            "models": models,
+        })
+    return result
+
+
+def parse_daily_cost(body: str, cur_day: int) -> list[dict]:
+    """Parse group_by=day cost response into [{day, cost}].
+
+    Supports multiple response shapes the DeepSeek cost API may return:
+      - biz_data.days[] with {date, data: [{model, usage:[{type, amount}]}]}
+      - biz_data as a flat list of {date, total: [{model, usage:[{type, amount}]}]}
+      - biz_data as a flat list of {date, amount} (simplified)
+    """
+    try:
+        o = json.loads(body)
+        biz = (o.get("data") or {}).get("biz_data") or {}
+    except Exception:
+        return []
+
+    # Shape 1: {days: [...]}
+    if isinstance(biz, dict):
+        days_raw = biz.get("days", [])
+        if not days_raw:
+            # Maybe the dict itself has date keys
+            days_raw = list(biz.values()) if biz else []
+    # Shape 2: flat list [{date, ...}, ...]
+    elif isinstance(biz, list):
+        days_raw = biz
+    else:
+        return []
+
+    result = []
+    for d in days_raw:
+        if not isinstance(d, dict):
+            continue
+        date_str = d.get("date", "")
+        try:
+            day_num = int(date_str.split("-")[2])
+        except Exception:
+            # Try 'day' key as fallback
+            day_num = d.get("day")
+            if day_num is None:
+                continue
+        if day_num > cur_day:
+            continue
+
+        total_cost = 0.0
+        # Format A: nested {data: [{model, usage:[{type, amount}]}]}
+        entries = d.get("data", [])
+        if entries:
+            for model_entry in entries:
+                for u in model_entry.get("usage", []):
+                    try:
+                        total_cost += float(u.get("amount", 0))
+                    except (TypeError, ValueError):
+                        pass
+        else:
+            # Format B: {total: [{model, usage:[{type, amount}]}]}
+            total_entries = d.get("total", [])
+            for model_entry in total_entries:
+                for u in model_entry.get("usage", []):
+                    try:
+                        total_cost += float(u.get("amount", 0))
+                    except (TypeError, ValueError):
+                        pass
+            # Format C: direct {amount: "0.123"} or {cost: "0.123"}
+            if total_cost == 0:
+                direct = d.get("amount") or d.get("cost") or 0
+                try:
+                    total_cost = float(direct)
+                except (TypeError, ValueError):
+                    pass
+
+        result.append({"day": day_num, "cost": round(total_cost, 6)})
+
     return result
 
 
@@ -157,12 +321,15 @@ def main() -> int:
     urls: dict[str, str] = {
         "summary": f"{BASE}/api/v0/users/get_user_summary",
         "daily": f"{BASE}/api/v0/usage/amount?year={cur_year}&month={cur_month}&group_by=day",
+        "dailyCost": f"{BASE}/api/v0/usage/cost?year={cur_year}&month={cur_month}&group_by=day",
     }
     for (y2, m2) in months_to_fetch:
         key_a = f"amount_{y2}_{m2}"
         key_c = f"cost_{y2}_{m2}"
+        key_daily = f"daily_{y2}_{m2}"
         urls[key_a] = f"{BASE}/api/v0/usage/amount?year={y2}&month={m2}"
         urls[key_c] = f"{BASE}/api/v0/usage/cost?year={y2}&month={m2}"
+        urls[key_daily] = f"{BASE}/api/v0/usage/amount?year={y2}&month={m2}&group_by=day"
 
     # Concurrent fetch
     raw: dict[str, tuple[int | None, str | None, str | None]] = {}
@@ -209,6 +376,7 @@ def main() -> int:
 
     # Parse amount + cost per month
     history: list[dict] = []
+    pricing_map: dict = {}  # derived from current month's official data
     for (y2, m2) in months_to_fetch:
         key_a = f"amount_{y2}_{m2}"
         key_c = f"cost_{y2}_{m2}"
@@ -243,19 +411,47 @@ def main() -> int:
         is_current = (y2 == cur_year and m2 == cur_month)
         if is_current:
             output["current"] = entry
+            # Derive exact per-model per-token-type pricing from official monthly
+            # amount + cost data so daily costs match the platform exactly.
+            if not a_err and a_code == 200 and not c_err and c_code == 200:
+                pricing_map = build_pricing_map(a_body or "", c_body or "")
         else:
             history.append(entry)
 
     output["history"] = history
 
-    # Parse daily breakdown for current month
-    d_code, d_body, d_err = raw.get("daily", (None, None, "not fetched"))
-    if not d_err and d_code == 200:
-        output["daily"] = parse_daily(d_body or "", now.day)
-    else:
-        output["daily"] = []
-        if d_err:
-            errors.append(f"daily: {d_err}")
+    # Parse daily breakdown for ALL months (with group_by=day)
+    daily_by_month: dict[str, list[dict]] = {}
+    for (y2, m2) in months_to_fetch:
+        month_key = f"{y2}-{m2}"
+        is_current = (y2 == cur_year and m2 == cur_month)
+        day_limit = now.day if is_current else 31  # cap future days for current month only
+        key_daily = f"daily_{y2}_{m2}"
+        d_code, d_body, d_err = raw.get(key_daily, (None, None, "not fetched"))
+
+        # For non-current months, rebuild pricing from their own monthly data
+        month_pricing = pricing_map if is_current else {}
+        if not is_current:
+            key_a = f"amount_{y2}_{m2}"
+            key_c = f"cost_{y2}_{m2}"
+            a_code2, a_body2, a_err2 = raw.get(key_a, (None, None, "not fetched"))
+            c_code2, c_body2, c_err2 = raw.get(key_c, (None, None, "not fetched"))
+            if not a_err2 and a_code2 == 200 and not c_err2 and c_code2 == 200:
+                month_pricing = build_pricing_map(a_body2 or "", c_body2 or "")
+
+        if not d_err and d_code == 200:
+            daily_data = parse_daily(d_body or "", day_limit, month_pricing)
+            daily_by_month[month_key] = daily_data
+            if is_current:
+                output["daily"] = daily_data
+        else:
+            daily_by_month[month_key] = []
+            if is_current:
+                output["daily"] = []
+            if d_err:
+                errors.append(f"daily_{month_key}: {d_err}")
+
+    output["dailyByMonth"] = daily_by_month
 
     if errors:
         output["ok"] = False
