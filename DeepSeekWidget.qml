@@ -432,7 +432,7 @@ PluginComponent {
                     width: parent.width
                     height: dataCol.implicitHeight + Theme.spacingM * 2
                     radius: Theme.cornerRadius
-                    color: Theme.surfaceContainerHigh
+                    color: "transparent"
 
                     Column {
                         id: dataCol
@@ -503,7 +503,7 @@ PluginComponent {
                     width: parent.width
                     height: 240
                     radius: Theme.cornerRadius
-                    color: Theme.surfaceContainerHigh
+                    color: "transparent"
 
                     Column {
                         anchors { fill: parent; margins: Theme.spacingM }
@@ -793,7 +793,7 @@ PluginComponent {
                         width: (parent.width - Theme.spacingS * 3) / 4
                         height: 34
                         text: "◀"
-                        backgroundColor: Theme.surfaceContainerHigh
+                        backgroundColor: "transparent"
                         textColor: root._canGoPrev() ? Theme.surfaceText : Theme.surfaceVariantText
                         onClicked: { if (root._canGoPrev()) root._goPrevMonth() }
                     }
@@ -801,7 +801,7 @@ PluginComponent {
                         width: (parent.width - Theme.spacingS * 3) / 4
                         height: 34
                         text: root.chartMode === "cost" ? "● Cost" : "Cost"
-                        backgroundColor: root.chartMode === "cost" ? Theme.primary : Theme.surfaceContainerHigh
+                        backgroundColor: root.chartMode === "cost" ? Theme.primary : "transparent"
                         textColor: root.chartMode === "cost" ? Theme.onPrimary : Theme.surfaceText
                         onClicked: { root.chartMode = "cost" }
                     }
@@ -809,7 +809,7 @@ PluginComponent {
                         width: (parent.width - Theme.spacingS * 3) / 4
                         height: 34
                         text: root.chartMode === "tokens" ? "● Tokens" : "Tokens"
-                        backgroundColor: root.chartMode === "tokens" ? Theme.primary : Theme.surfaceContainerHigh
+                        backgroundColor: root.chartMode === "tokens" ? Theme.primary : "transparent"
                         textColor: root.chartMode === "tokens" ? Theme.onPrimary : Theme.surfaceText
                         onClicked: { root.chartMode = "tokens" }
                     }
@@ -817,7 +817,7 @@ PluginComponent {
                         width: (parent.width - Theme.spacingS * 3) / 4
                         height: 34
                         text: "▶"
-                        backgroundColor: Theme.surfaceContainerHigh
+                        backgroundColor: "transparent"
                         textColor: root._canGoNext() ? Theme.surfaceText : Theme.surfaceVariantText
                         onClicked: { if (root._canGoNext()) root._goNextMonth() }
                     }
