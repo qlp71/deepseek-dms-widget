@@ -1,8 +1,8 @@
 {
   "id": "deepseekWidget",
   "name": "DeepSeek Usage",
-  "description": "API balance & platform token usage, Cookie auto-login",
-  "version": "1.0.1",
+  "description": "API balance & platform token usage, per-API-key cost breakdown, Cookie auto-login",
+  "version": "1.1.0",
   "author": "gylove1994",
   "type": "widget",
   "capabilities": ["dankbar-widget"],

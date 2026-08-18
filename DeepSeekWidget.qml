@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import qs.Common
 import qs.Services
@@ -67,6 +68,14 @@ PluginComponent {
     // Cached daily data per month: {"2026-7": [...], "2026-6": [...]}
     property var dailyCache: pluginData.dailyCache || {}
 
+    // API keys + per-key usage (platform "by API key" view)
+    // apiKeys: [{trackingId, name, sensitiveId}]
+    property var apiKeys: pluginData.apiKeys || []
+    // byApiKeyCache: {trackingId: {"2026-7": [daily...], ...}}
+    property var byApiKeyCache: pluginData.byApiKeyCache || {}
+    // "" = all keys (account aggregate); otherwise a trackingId
+    property string selectedKeyId: pluginData.selectedKeyId || ""
+
     // Chart state
     property string chartMode: "cost"     // "cost" | "tokens"
     property int viewYear: 0
@@ -90,7 +99,7 @@ PluginComponent {
 
     // ── Today's cost ───────────────────────────────────────────
     function _getTodayCost() {
-        const dl = daily || []
+        const dl = root._getCurrentMonthDaily()
         const now = new Date()
         const today = now.getDate()
         for (const d of dl) {
@@ -99,29 +108,85 @@ PluginComponent {
         return "—"
     }
 
+    // ── Per-key helpers ────────────────────────────────────────
+    function _selectedKeyName() {
+        if (root.selectedKeyId === "") return ""
+        for (const k of root.apiKeys) {
+            if (k.trackingId === root.selectedKeyId) return k.name || k.trackingId
+        }
+        return root.selectedKeyId
+    }
+
+    function _selectedKeySuffix() {
+        const n = root._selectedKeyName()
+        return n ? "  ·  " + n : ""
+    }
+
+    function _setSelectedKey(id) {
+        const v = id || ""
+        if (root.selectedKeyId === v) return
+        root.selectedKeyId = v
+        savePluginData({ selectedKeyId: v })
+    }
+
+    // Daily array of the currently viewed (month, key) combo
+    function _getCurrentMonthDaily() {
+        const key = _monthKey(root.curYear, root.curMonth)
+        if (root.selectedKeyId === "") return root.daily || []
+        const pk = root.byApiKeyCache[root.selectedKeyId]
+        if (!pk) return []
+        return pk[key] || []
+    }
+
+    // {input, output, cost} for the current month, respecting the selected key
+    function _monthlyStats() {
+        if (root.selectedKeyId === "") {
+            return { input: root.inputTokens, output: root.outputTokens, cost: root.monthlyCost }
+        }
+        const data = root._getCurrentMonthDaily()
+        let inp = 0, out = 0, cost = 0
+        for (const d of data) {
+            inp += d.inputTokens || 0
+            out += d.outputTokens || 0
+            cost += d.cost || 0
+        }
+        return { input: inp, output: out, cost: _fmtCurrency(cost) }
+    }
+
+    // Sorted month keys available for the current key selection
+    function _getMonthKeys() {
+        if (root.selectedKeyId === "") return Object.keys(root.dailyCache).sort()
+        const pk = root.byApiKeyCache[root.selectedKeyId]
+        if (!pk) return []
+        return Object.keys(pk).sort()
+    }
+
     // ── Chart data helpers ──────────────────────────────────────
     function _monthKey(y, m) { return y + "-" + m }
 
     function _getChartData() {
         const key = _monthKey(viewYear, viewMonth)
-        return dailyCache[key] || []
+        if (root.selectedKeyId === "") return root.dailyCache[key] || []
+        const pk = root.byApiKeyCache[root.selectedKeyId]
+        if (!pk) return []
+        return pk[key] || []
     }
 
     function _canGoPrev() {
-        const keys = Object.keys(dailyCache).sort()
+        const keys = _getMonthKeys()
         const key = _monthKey(viewYear, viewMonth)
         return keys.indexOf(key) > 0
     }
 
     function _canGoNext() {
-        const keys = Object.keys(dailyCache).sort()
+        const keys = _getMonthKeys()
         const key = _monthKey(viewYear, viewMonth)
         const idx = keys.indexOf(key)
         return idx >= 0 && idx < keys.length - 1
     }
 
     function _goPrevMonth() {
-        const keys = Object.keys(dailyCache).sort()
+        const keys = _getMonthKeys()
         const key = _monthKey(viewYear, viewMonth)
         const idx = keys.indexOf(key)
         if (idx > 0) {
@@ -131,7 +196,7 @@ PluginComponent {
     }
 
     function _goNextMonth() {
-        const keys = Object.keys(dailyCache).sort()
+        const keys = _getMonthKeys()
         const key = _monthKey(viewYear, viewMonth)
         const idx = keys.indexOf(key)
         if (idx >= 0 && idx < keys.length - 1) {
@@ -224,6 +289,27 @@ PluginComponent {
             }
             root.dailyCache = cache
             savePluginData({ dailyCache: cache, history: root.history })
+        }
+
+        // API keys + per-key usage cache (platform "by API key" view)
+        if (o.apiKeys && Array.isArray(o.apiKeys)) {
+            root.apiKeys = o.apiKeys
+        }
+        if (o.byApiKey && typeof o.byApiKey === "object") {
+            const cache = Object.assign({}, pluginData.byApiKeyCache || {})
+            for (const tid of Object.keys(o.byApiKey)) {
+                cache[tid] = Object.assign({}, cache[tid] || {}, o.byApiKey[tid])
+            }
+            root.byApiKeyCache = cache
+            savePluginData({ apiKeys: root.apiKeys, byApiKeyCache: cache, history: root.history })
+        }
+        // Drop the selection if its key no longer exists
+        if (root.selectedKeyId !== "") {
+            const found = root.apiKeys.some(k => k.trackingId === root.selectedKeyId)
+            if (!found) {
+                root.selectedKeyId = ""
+                savePluginData({ selectedKeyId: "" })
+            }
         }
 
         // Initialize viewYear/viewMonth from current data
@@ -370,12 +456,22 @@ PluginComponent {
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceText
             }
+
+            // Selected key indicator (when a specific key is being viewed)
+            StyledText {
+                visible: root.cookieStatus !== "missing" && root.selectedKeyId !== ""
+                text: "· " + root._selectedKeyName()
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+                elide: Text.ElideRight
+                width: Math.min(implicitWidth, 90)
+            }
         }
     }
 
     // ── Popout ────────────────────────────────────────────────
     popoutWidth: 420
-    popoutHeight: 660
+    popoutHeight: 700
 
     popoutContent: Component {
         PopoutComponent {
@@ -439,12 +535,63 @@ PluginComponent {
                         anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; margins: Theme.spacingM }
                         spacing: Theme.spacingS
 
-                        StyledText {
-                            text: root.curYear > 0
-                                ? (root.curYear + "-" + (root.curMonth < 10 ? "0" + root.curMonth : root.curMonth) + " UTC")
-                                : "—"
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.surfaceVariantText
+                        // Header line: month + selected key (left), actions (right)
+                        Item {
+                            width: parent.width
+                            height: 28
+
+                            StyledText {
+                                text: root.curYear > 0
+                                    ? (root.curYear + "-" + (root.curMonth < 10 ? "0" + root.curMonth : root.curMonth) + " UTC" + root._selectedKeySuffix())
+                                    : "—"
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.surfaceVariantText
+                                elide: Text.ElideRight
+                                anchors { left: parent.left; right: walletBtn.left; verticalCenter: parent.verticalCenter }
+                            }
+
+                            // Chart actions moved here from the chart title row:
+                            // top-up, re-login, refresh
+                            DankButton {
+                                id: walletBtn
+                                width: 28; height: 28
+                                text: ""
+                                iconName: "wallet"
+                                backgroundColor: "transparent"
+                                textColor: "#f9e2af"
+                                anchors { right: loginBtn.left; rightMargin: 2; verticalCenter: parent.verticalCenter }
+                                onClicked: Proc.runCommand(
+                                    _cmdId + ".topup",
+                                    ["sh", "-c", "xdg-open https://platform.deepseek.com/top_up"],
+                                    function() {}, 0, 5000
+                                )
+                            }
+
+                            DankButton {
+                                id: loginBtn
+                                width: 28; height: 28
+                                text: ""
+                                iconName: "vpn_key"
+                                backgroundColor: "transparent"
+                                textColor: root.cookieStatus === "missing" ? Theme.error
+                                         : root.cookieStatus === "expired" ? Theme.error
+                                         : Theme.surfaceVariantText
+                                opacity: root.loginRunning ? 0.4 : 1
+                                anchors { right: refreshBtn.left; rightMargin: 2; verticalCenter: parent.verticalCenter }
+                                onClicked: root.launchLogin()
+                            }
+
+                            DankButton {
+                                id: refreshBtn
+                                width: 28; height: 28
+                                text: ""
+                                iconName: "refresh"
+                                backgroundColor: "transparent"
+                                textColor: Theme.surfaceVariantText
+                                opacity: root.fetchRunning ? 0.4 : 1
+                                anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                                onClicked: root.refreshAll()
+                            }
                         }
 
                         Row {
@@ -453,10 +600,10 @@ PluginComponent {
 
                             Repeater {
                                 model: [
-                                    { label: tr.balance || "Balance",           value: root.balanceNormal,              color: Theme.primary },
-                                    { label: tr.thisMonthInput || "Input (Mo.)",  value: root._fmtTokens(root.inputTokens),  color: "#89dceb" },
-                                    { label: tr.thisMonthOutput || "Output (Mo.)", value: root._fmtTokens(root.outputTokens), color: "#cba6f7" },
-                                    { label: tr.thisMonthCost || "Cost (Mo.)",   value: root.monthlyCost,                color: "#f9e2af" }
+                                    { label: tr.balance || "Balance",            value: root.balanceNormal,                    color: Theme.primary },
+                                    { label: tr.thisMonthInput || "Input (Mo.)",  value: root._fmtTokens(root._monthlyStats().input),  color: "#89dceb" },
+                                    { label: tr.thisMonthOutput || "Output (Mo.)", value: root._fmtTokens(root._monthlyStats().output), color: "#cba6f7" },
+                                    { label: tr.thisMonthCost || "Cost (Mo.)",   value: root._monthlyStats().cost,               color: "#f9e2af" }
                                 ]
 
                                 delegate: Column {
@@ -501,7 +648,7 @@ PluginComponent {
                 // Trend chart
                 StyledRect {
                     width: parent.width
-                    height: 240
+                    height: 270
                     radius: Theme.cornerRadius
                     color: "transparent"
 
@@ -510,66 +657,138 @@ PluginComponent {
                         spacing: Theme.spacingXS
 
                         Item {
-                            width: parent.width; height: 28
+                            width: parent.width; height: 58
 
-                            StyledText {
-                                id: chartTitle
-                                text: {
-                                    const m = root.viewMonth < 10 ? "0" + root.viewMonth : root.viewMonth
-                                    const suffix = root._isCurrentMonth() ? " (" + (root.tr.currentMonth || "Current") + ")" : ""
-                                    return (root.tr.dailyChart || "Daily Usage") + "  " + root.viewYear + "-" + m + suffix
+                            Column {
+                                anchors.fill: parent
+                                spacing: 2
+
+                                // Row 1: chart title + month total (actions live in the data card header)
+                                Item {
+                                    width: parent.width; height: 28
+
+                                    StyledText {
+                                        id: chartTitle
+                                        text: {
+                                            const m = root.viewMonth < 10 ? "0" + root.viewMonth : root.viewMonth
+                                            const suffix = root._isCurrentMonth() ? " (" + (root.tr.currentMonth || "Current") + ")" : ""
+                                            return (root.tr.dailyChart || "Daily Usage") + "  " + root.viewYear + "-" + m + suffix + root._selectedKeySuffix()
+                                        }
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        color: Theme.surfaceVariantText
+                                        elide: Text.ElideRight
+                                        anchors { left: parent.left; verticalCenter: parent.verticalCenter }
+                                    }
+
+                                    StyledText {
+                                        text: "  ·  " + root._getMonthTotal()
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        font.weight: Font.Bold
+                                        color: root.chartMode === "cost" ? "#f9e2af" : Theme.surfaceText
+                                        anchors { left: chartTitle.right; verticalCenter: parent.verticalCenter }
+                                    }
                                 }
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: Theme.surfaceVariantText
-                                anchors { left: parent.left; verticalCenter: parent.verticalCenter }
-                            }
 
-                            StyledText {
-                                text: "  ·  " + root._getMonthTotal()
-                                font.pixelSize: Theme.fontSizeSmall
-                                font.weight: Font.Bold
-                                color: root.chartMode === "cost" ? "#f9e2af" : Theme.surfaceText
-                                anchors { left: chartTitle.right; verticalCenter: parent.verticalCenter }
-                            }
+                                // Row 2: API key selector (hidden when no keys available)
+                                Item {
+                                    width: parent.width; height: 28
+                                    visible: root.apiKeys.length > 0
 
-                            DankButton {
-                                width: 28; height: 28
-                                text: "¥"
-                                iconName: ""
-                                backgroundColor: "transparent"
-                                textColor: "#f9e2af"
-                                anchors { right: loginBtn.left; rightMargin: 2; verticalCenter: parent.verticalCenter }
-                                onClicked: Proc.runCommand(
-                                    _cmdId + ".topup",
-                                    ["sh", "-c", "xdg-open https://platform.deepseek.com/top_up"],
-                                    function() {}, 0, 5000
-                                )
-                            }
+                                    ListModel { id: keyModel }
 
-                            DankButton {
-                                id: loginBtn
-                                width: 28; height: 28
-                                text: ""
-                                iconName: "vpn_key"
-                                backgroundColor: "transparent"
-                                textColor: root.cookieStatus === "missing" ? Theme.error
-                                         : root.cookieStatus === "expired" ? Theme.error
-                                         : Theme.surfaceVariantText
-                                opacity: root.loginRunning ? 0.4 : 1
-                                anchors { right: refreshBtn.left; rightMargin: 2; verticalCenter: parent.verticalCenter }
-                                onClicked: root.launchLogin()
-                            }
+                                    ComboBox {
+                                        id: keySelect
+                                        anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter }
+                                        height: 28
 
-                            DankButton {
-                                id: refreshBtn
-                                width: 28; height: 28
-                                text: ""
-                                iconName: "refresh"
-                                backgroundColor: "transparent"
-                                textColor: Theme.surfaceVariantText
-                                opacity: root.fetchRunning ? 0.4 : 1
-                                anchors { right: parent.right; verticalCenter: parent.verticalCenter }
-                                onClicked: root.refreshAll()
+                                        model: keyModel
+                                        textRole: "text"
+                                        valueRole: "value"
+
+                                        function _rebuildKeyModel() {
+                                            keyModel.clear()
+                                            keyModel.append({ text: root.tr.allKeys || "All Keys", value: "" })
+                                            for (const k of root.apiKeys) {
+                                                keyModel.append({ text: k.name || k.trackingId, value: k.trackingId })
+                                            }
+                                            keySelect.currentIndex = _indexOfKey(root.selectedKeyId)
+                                        }
+
+                                        function _indexOfKey(id) {
+                                            for (let i = 0; i < keyModel.count; i++) {
+                                                if (keyModel.get(i).value === id) return i
+                                            }
+                                            return 0
+                                        }
+
+                                        contentItem: StyledText {
+                                            text: keySelect.displayText
+                                            color: Theme.surfaceText
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            verticalAlignment: Text.AlignVCenter
+                                            horizontalAlignment: Text.AlignLeft
+                                            elide: Text.ElideRight
+                                            leftPadding: 8
+                                        }
+
+                                        background: Rectangle {
+                                            radius: Theme.cornerRadius
+                                            color: Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.08)
+                                            border.color: Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.3)
+                                            border.width: 1
+                                        }
+
+                                        delegate: ItemDelegate {
+                                            width: keySelect.width
+                                            height: 30
+                                            highlighted: keySelect.highlightedIndex === index
+                                            contentItem: StyledText {
+                                                text: model.text
+                                                color: parent.highlighted ? Theme.primary : Theme.surfaceText
+                                                font.pixelSize: Theme.fontSizeSmall
+                                                elide: Text.ElideRight
+                                                verticalAlignment: Text.AlignVCenter
+                                                leftPadding: 8
+                                            }
+                                            background: Rectangle {
+                                                color: parent.highlighted ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.12) : "transparent"
+                                            }
+                                        }
+
+                                        popup: Popup {
+                                            y: keySelect.height + 2
+                                            width: keySelect.width
+                                            implicitHeight: Math.min(contentItem.implicitHeight + 4, 220)
+                                            padding: 0
+                                            contentItem: ListView {
+                                                clip: true
+                                                implicitHeight: contentHeight
+                                                model: keySelect.delegateModel
+                                                delegate: keySelect.delegate
+                                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                            }
+                                            background: Rectangle {
+                                                color: Theme.surfaceContainerHighest
+                                                radius: Theme.cornerRadius
+                                                border.color: Theme.outline
+                                                border.width: 1
+                                            }
+                                        }
+
+                                        Component.onCompleted: _rebuildKeyModel()
+
+                                        Connections {
+                                            target: root
+                                            function onApiKeysChanged() { _rebuildKeyModel() }
+                                            function onTrChanged() { _rebuildKeyModel() }
+                                        }
+
+                                        onActivated: {
+                                            const v = keyModel.get(keySelect.currentIndex).value
+                                            root._setSelectedKey(v === undefined ? "" : v)
+                                        }
+                                    }
+                                }
                             }
                         }
 

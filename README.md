@@ -7,6 +7,7 @@ A [Dank Material Shell](https://github.com/Quickshell/DankMaterialShell) widget 
 ## Features
 
 - **Balance at a glance** — normal balance and today's cost in the bar pill
+- **Per-API-key cost breakdown** — dropdown in the chart header to view usage/cost for each API key separately (e.g. per project), or the account total
 - **Monthly breakdown** — input/output token counts and cost for the current month
 - **Dual-mode daily chart** — toggle between cost (¥, single gold bars) and tokens (per-model stacked bars with input/output split)
 - **Month navigation** — browse historical months cached locally; no repeated API calls
@@ -132,6 +133,7 @@ Click the bar pill to open the full panel with:
   - **Tokens** — per-model stacked bars (e.g. v4-pro + v4-flash) with input/output split
 - **Month navigation** — ◀ / ▶ buttons to browse past months (data cached locally)
 - **Chart header icons** — top-up (¥), login (🔑), and refresh
+- **API key selector** — a dropdown under the chart header lets you switch between **All Keys** (account total) and each individual API key; the chart, monthly stats and today's cost all follow the selection (persisted between restarts)
 - Bottom row: ◀ Cost Tokens ▶
 
 ### Settings
@@ -151,6 +153,16 @@ The widget calls DeepSeek Platform's internal APIs using your session cookie:
 | `/api/v0/usage/amount` | Token usage breakdown (monthly) |
 | `/api/v0/usage/amount?group_by=day` | Daily per-model token usage |
 | `/api/v0/usage/cost` | Cost breakdown (monthly, for pricing derivation) |
+| `/api/v0/users/get_api_keys` | API key list (names + tracking ids) |
+| `/api/v0/usage/by_api_key/amount?start=S&end=E&tz=Z` | Per-API-key usage buckets |
+| `/api/v0/usage/by_api_key/cost?start=S&end=E&tz=Z` | Per-API-key cost buckets |
+
+Per-key usage/cost is fetched from the platform's "by API key" view endpoints,
+which take an epoch-second `[start, end)` range plus a whole-hour timezone
+offset in seconds (exactly what the new platform UI sends). If the endpoints
+are unavailable (404, older platform version), the widget simply hides the key
+selector. Note that balance is account-wide — all keys share the same wallet —
+so only usage and cost are broken down per key.
 
 Pricing is derived from DeepSeek's own monthly cost ÷ token counts per model and token type, so it always matches the official platform regardless of peak/off-peak changes.
 

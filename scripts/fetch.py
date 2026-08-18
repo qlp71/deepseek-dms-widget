@@ -6,6 +6,15 @@ Endpoints (all require platform.deepseek.com cookie):
   GET /api/v0/users/get_user_summary  -> balance + monthly summary
   GET /api/v0/usage/amount?year=Y&month=M -> input/output token breakdown
   GET /api/v0/usage/cost?year=Y&month=M   -> cost breakdown
+  GET /api/v0/users/get_api_keys      -> list of API keys
+  GET /api/v0/usage/by_api_key/amount?start=S&end=E&tz=Z -> per-key usage buckets
+  GET /api/v0/usage/by_api_key/cost?start=S&end=E&tz=Z   -> per-key cost buckets
+
+The `by_api_key` endpoints back the platform's new "by API key" usage view and
+let the widget break spending down per API key.  They take an epoch-second
+[start, end) range plus a whole-hour timezone offset (seconds), mirroring the
+platform frontend exactly.  They return 404 on older platform versions; the
+fetcher then simply reports no keys.
 """
 
 from __future__ import annotations
@@ -14,9 +23,9 @@ import argparse
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 BASE = "https://platform.deepseek.com"
@@ -38,6 +47,8 @@ def fetch_url(url: str, credential: str, timeout: int = 30) -> tuple[int | None,
     try:
         with urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8"), None
+    except HTTPError as e:
+        return e.code, None, f"HTTP {e.code}"
     except URLError as e:
         return None, None, str(e.reason)
     except Exception as e:
@@ -287,6 +298,203 @@ def parse_daily_cost(body: str, cur_day: int) -> list[dict]:
     return result
 
 
+# ── Per-API-key usage (platform "by API key" view) ──────────────────
+
+def get_tz_sec() -> int:
+    """Whole-hour timezone offset in seconds (matches the platform's `tz` param)."""
+    local = datetime.now().astimezone()
+    off = int(local.utcoffset().total_seconds())
+    return 3600 * (off // 3600)
+
+
+def month_range_secs(year: int, month: int, tz_sec: int) -> tuple[int, int]:
+    """Local-midnight epoch range for a month: [start of day 1, start of next month)."""
+    start_dt = datetime(year, month, 1, tzinfo=timezone.utc)
+    if month == 12:
+        end_dt = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end_dt = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+    start = int(start_dt.timestamp()) - tz_sec
+    end = int(end_dt.timestamp()) - tz_sec
+    return start, end
+
+
+def parse_api_keys(body: str) -> list[dict]:
+    """Parse /api/v0/users/get_api_keys response -> [{trackingId, name, sensitiveId}]."""
+    try:
+        o = json.loads(body)
+        biz = (o.get("data") or {}).get("biz_data") or {}
+        keys = biz.get("api_keys") or []
+    except Exception:
+        return []
+    result = []
+    for k in keys:
+        tid = k.get("tracking_id")
+        if not tid:
+            continue
+        result.append({
+            "trackingId": tid,
+            "name": k.get("name") or tid,
+            "sensitiveId": k.get("sensitive_id") or "",
+        })
+    return result
+
+
+def collect_key_meta_from_series(bodies: list[str]) -> dict[str, dict]:
+    """Fallback: derive {tracking_id: {trackingId, name, sensitiveId}} from by_api_key series.
+
+    The by_api_key/amount response already carries api_key metadata per series,
+    so keys can be listed even if get_api_keys itself fails.
+    """
+    meta: dict[str, dict] = {}
+    for body in bodies:
+        if not body:
+            continue
+        try:
+            o = json.loads(body)
+            biz = (o.get("data") or {}).get("biz_data") or {}
+            series = biz.get("series") or []
+        except Exception:
+            continue
+        for item in series:
+            api_key = item.get("api_key") or {}
+            tid = api_key.get("tracking_id")
+            if not tid:
+                continue
+            meta.setdefault(tid, {
+                "trackingId": tid,
+                "name": api_key.get("name") or tid,
+                "sensitiveId": api_key.get("sensitive_id") or "",
+            })
+    return meta
+
+
+def parse_by_api_key_amount(body: str, tz_sec: int, cur_day: int) -> dict[str, dict]:
+    """Parse /api/v0/usage/by_api_key/amount response.
+
+    biz_data.series[] = [{api_key:{tracking_id,name,sensitive_id,valid}, model,
+                          buckets:[{time (unix sec), usage:{RESPONSE_TOKEN, REQUEST,
+                          PROMPT_CACHE_HIT_TOKEN, PROMPT_CACHE_MISS_TOKEN}}]}]
+
+    Buckets are aggregated per day in the requested timezone (the platform may
+    return hourly buckets for short ranges; this always folds them by day).
+
+    Returns {tid: {day: {"inp": int, "out": int, "models": {model: {"inp":..,"out":..}}}}}
+    """
+    try:
+        o = json.loads(body)
+        biz = (o.get("data") or {}).get("biz_data") or {}
+        series = biz.get("series") or []
+    except Exception:
+        return {}
+    tzinfo = timezone(timedelta(seconds=tz_sec))
+
+    result: dict[str, dict] = {}
+    for item in series:
+        api_key = item.get("api_key") or {}
+        tid = api_key.get("tracking_id")
+        if not tid:
+            continue
+        model = item.get("model", "unknown")
+        for b in item.get("buckets") or []:
+            t = b.get("time")
+            if t is None:
+                continue
+            try:
+                day_num = datetime.fromtimestamp(int(t), tz=tzinfo).day
+            except (TypeError, ValueError, OSError):
+                continue
+            if day_num > cur_day:
+                continue
+            usage = b.get("usage") or {}
+            try:
+                hit = int(usage.get("PROMPT_CACHE_HIT_TOKEN") or 0)
+                miss = int(usage.get("PROMPT_CACHE_MISS_TOKEN") or 0)
+                out = int(usage.get("RESPONSE_TOKEN") or 0)
+            except (TypeError, ValueError):
+                hit = miss = out = 0
+            if hit == 0 and miss == 0 and out == 0:
+                continue
+            day = result.setdefault(tid, {}).setdefault(day_num, {"inp": 0, "out": 0, "models": {}})
+            day["inp"] += hit + miss
+            day["out"] += out
+            m = day["models"].setdefault(model, {"inp": 0, "out": 0})
+            m["inp"] += hit + miss
+            m["out"] += out
+    return result
+
+
+def parse_by_api_key_cost(body: str, tz_sec: int, cur_day: int) -> dict[str, dict]:
+    """Parse /api/v0/usage/by_api_key/cost response.
+
+    biz_data.data[] = [{currency, series: [{api_key, model, buckets:[{time, cost}]}]}]
+    Returns {tid: {day: {model: cost}}}
+    """
+    try:
+        o = json.loads(body)
+        biz = (o.get("data") or {}).get("biz_data") or {}
+        data = biz.get("data") if isinstance(biz, dict) else biz
+    except Exception:
+        return {}
+    if not isinstance(data, list):
+        return {}
+    tzinfo = timezone(timedelta(seconds=tz_sec))
+
+    result: dict[str, dict] = {}
+    for group in data:
+        for item in group.get("series") or []:
+            api_key = item.get("api_key") or {}
+            tid = api_key.get("tracking_id")
+            if not tid:
+                continue
+            model = item.get("model", "unknown")
+            for b in item.get("buckets") or []:
+                t = b.get("time")
+                if t is None:
+                    continue
+                try:
+                    day_num = datetime.fromtimestamp(int(t), tz=tzinfo).day
+                    cost = float(b.get("cost") or 0)
+                except (TypeError, ValueError, OSError):
+                    continue
+                if day_num > cur_day or cost <= 0:
+                    continue
+                day = result.setdefault(tid, {}).setdefault(day_num, {})
+                day[model] = day.get(model, 0.0) + cost
+    return result
+
+
+def merge_by_api_key(amount_map: dict, cost_map: dict) -> dict[str, list[dict]]:
+    """Combine per-key amount + cost daily data into the widget's daily shape.
+
+    Returns {tid: [{day, inputTokens, outputTokens, cost, models:
+                    [{model, inputTokens, outputTokens, cost}]}]}
+    """
+    out: dict[str, list[dict]] = {}
+    for tid in sorted(set(amount_map) | set(cost_map)):
+        a_days = amount_map.get(tid) or {}
+        c_days = cost_map.get(tid) or {}
+        merged: dict[int, dict] = {}
+        for d, v in a_days.items():
+            merged[d] = {"day": d, "inputTokens": v["inp"], "outputTokens": v["out"], "cost": 0.0, "models": []}
+        for d, models in c_days.items():
+            day = merged.setdefault(d, {"day": d, "inputTokens": 0, "outputTokens": 0, "cost": 0.0, "models": []})
+            day["cost"] = round(sum(models.values()), 6)
+        for d, v in a_days.items():
+            day = merged[d]
+            day["models"] = [
+                {
+                    "model": model,
+                    "inputTokens": mv["inp"],
+                    "outputTokens": mv["out"],
+                    "cost": round(c_days.get(d, {}).get(model, 0.0), 6),
+                }
+                for model, mv in v["models"].items()
+            ]
+        out[tid] = [merged[d] for d in sorted(merged)]
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fetch DeepSeek platform usage")
     ap.add_argument("--cookie-file", required=True, help="Path to cookie.txt")
@@ -306,6 +514,9 @@ def main() -> int:
 
     now = datetime.now(timezone.utc)
     cur_year, cur_month = now.year, now.month
+    tz_sec = get_tz_sec()
+    local_now = datetime.now()  # for capping "future" days in the current month
+    local_day = local_now.day
 
     # Build list of months to fetch (oldest first)
     months_to_fetch: list[tuple[int, int]] = []
@@ -322,6 +533,7 @@ def main() -> int:
         "summary": f"{BASE}/api/v0/users/get_user_summary",
         "daily": f"{BASE}/api/v0/usage/amount?year={cur_year}&month={cur_month}&group_by=day",
         "dailyCost": f"{BASE}/api/v0/usage/cost?year={cur_year}&month={cur_month}&group_by=day",
+        "apiKeys": f"{BASE}/api/v0/users/get_api_keys",
     }
     for (y2, m2) in months_to_fetch:
         key_a = f"amount_{y2}_{m2}"
@@ -330,6 +542,10 @@ def main() -> int:
         urls[key_a] = f"{BASE}/api/v0/usage/amount?year={y2}&month={m2}"
         urls[key_c] = f"{BASE}/api/v0/usage/cost?year={y2}&month={m2}"
         urls[key_daily] = f"{BASE}/api/v0/usage/amount?year={y2}&month={m2}&group_by=day"
+        # Per-API-key usage/cost (platform "by API key" view): epoch range + tz
+        s_sec, e_sec = month_range_secs(y2, m2, tz_sec)
+        urls[f"byKeyAmount_{y2}_{m2}"] = f"{BASE}/api/v0/usage/by_api_key/amount?start={s_sec}&end={e_sec}&tz={tz_sec}"
+        urls[f"byKeyCost_{y2}_{m2}"] = f"{BASE}/api/v0/usage/by_api_key/cost?start={s_sec}&end={e_sec}&tz={tz_sec}"
 
     # Concurrent fetch
     raw: dict[str, tuple[int | None, str | None, str | None]] = {}
@@ -425,7 +641,7 @@ def main() -> int:
     for (y2, m2) in months_to_fetch:
         month_key = f"{y2}-{m2}"
         is_current = (y2 == cur_year and m2 == cur_month)
-        day_limit = now.day if is_current else 31  # cap future days for current month only
+        day_limit = local_day if is_current else 31  # cap future days for current month only
         key_daily = f"daily_{y2}_{m2}"
         d_code, d_body, d_err = raw.get(key_daily, (None, None, "not fetched"))
 
@@ -452,6 +668,52 @@ def main() -> int:
                 errors.append(f"daily_{month_key}: {d_err}")
 
     output["dailyByMonth"] = daily_by_month
+
+    # ── Per-API-key usage (platform "by API key" view) ───────────────
+    output["apiKeys"] = []
+    output["byApiKey"] = {}
+
+    k_code, k_body, k_err = raw.get("apiKeys", (None, None, "not fetched"))
+    api_keys = parse_api_keys(k_body or "") if (not k_err and k_code == 200) else []
+
+    by_api_key: dict[str, dict] = {}
+    by_api_key_supported = True
+    for (y2, m2) in months_to_fetch:
+        month_key = f"{y2}-{m2}"
+        is_current = (y2 == cur_year and m2 == cur_month)
+        day_limit = local_day if is_current else 31
+
+        a_code, a_body, a_err = raw.get(f"byKeyAmount_{y2}_{m2}", (None, None, "not fetched"))
+        c_code, c_body, c_err = raw.get(f"byKeyCost_{y2}_{m2}", (None, None, "not fetched"))
+
+        # The by_api_key endpoints only exist on the new platform UI; a 404
+        # means the per-key view is unavailable on this account/version.
+        if a_code == 404 or c_code == 404:
+            by_api_key_supported = False
+            break
+        if a_err or c_err or a_code != 200 or c_code != 200:
+            if is_current:
+                errors.append(f"by_api_key_{month_key}: amount={a_err or a_code} cost={c_err or c_code}")
+            continue
+
+        amount_map = parse_by_api_key_amount(a_body or "", tz_sec, day_limit)
+        cost_map = parse_by_api_key_cost(c_body or "", tz_sec, day_limit)
+        for tid, daily in merge_by_api_key(amount_map, cost_map).items():
+            by_api_key.setdefault(tid, {})[month_key] = daily
+
+    if by_api_key_supported:
+        # Fallback: derive key metadata from the series themselves when
+        # get_api_keys is unavailable.
+        series_bodies = [
+            (raw.get(f"byKeyAmount_{y2}_{m2}", (None, None, ""))[1] or "")
+            for (y2, m2) in months_to_fetch
+        ]
+        known = {k["trackingId"] for k in api_keys}
+        for tid, meta in collect_key_meta_from_series(series_bodies).items():
+            if tid not in known:
+                api_keys.append(meta)
+        output["apiKeys"] = api_keys
+        output["byApiKey"] = by_api_key
 
     if errors:
         output["ok"] = False

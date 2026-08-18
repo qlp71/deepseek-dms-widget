@@ -34,6 +34,8 @@
   "inputTokens": "Input",
   "outputTokens": "Output",
   "costLabel": "Cost (¥)",
+  "allKeys": "All Keys",
+  "keySelect": "Select API Key",
   "min1": "1 min",
   "min5": "5 min",
   "min15": "15 min",
