@@ -648,16 +648,18 @@ PluginComponent {
                 // Trend chart
                 StyledRect {
                     width: parent.width
-                    height: 270
+                    height: chartCol.implicitHeight + Theme.spacingM * 2
                     radius: Theme.cornerRadius
                     color: "transparent"
 
                     Column {
-                        anchors { fill: parent; margins: Theme.spacingM }
+                        id: chartCol
+                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: Theme.spacingM }
                         spacing: Theme.spacingXS
 
                         Item {
-                            width: parent.width; height: 58
+                            width: parent.width
+                            height: keyRow.visible ? 58 : 28
 
                             Column {
                                 anchors.fill: parent
@@ -691,6 +693,7 @@ PluginComponent {
 
                                 // Row 2: API key selector (hidden when no keys available)
                                 Item {
+                                    id: keyRow
                                     width: parent.width; height: 28
                                     visible: root.apiKeys.length > 0
 
@@ -961,8 +964,8 @@ PluginComponent {
                             }
                         }
 
-                        // Legend
-                        Row {
+                        // Legend (wraps to multiple rows when it doesn't fit)
+                        Flow {
                             spacing: Theme.spacingM
                             visible: root.chartMode === "tokens"
 
@@ -983,13 +986,17 @@ PluginComponent {
                                     }
                                     return []
                                 }
-                                delegate: Column {
-                                    spacing: 2
-                                    Row {
-                                        spacing: 4
-                                        Rectangle { width: 10; height: 6; radius: 1; color: modelData.inColor; opacity: 0.85; anchors.verticalCenter: parent.verticalCenter }
-                                        Rectangle { width: 10; height: 6; radius: 1; color: modelData.outColor; opacity: 0.85; anchors.verticalCenter: parent.verticalCenter }
-                                        StyledText { text: modelData.name; font.pixelSize: Theme.fontSizeSmall - 1; color: Theme.surfaceVariantText }
+                                delegate: Row {
+                                    spacing: 4
+                                    Rectangle { width: 10; height: 6; radius: 1; color: modelData.inColor; opacity: 0.85; anchors.verticalCenter: parent.verticalCenter }
+                                    Rectangle { width: 10; height: 6; radius: 1; color: modelData.outColor; opacity: 0.85; anchors.verticalCenter: parent.verticalCenter }
+                                    StyledText {
+                                        text: modelData.name
+                                        font.pixelSize: Theme.fontSizeSmall - 1
+                                        color: Theme.surfaceVariantText
+                                        elide: Text.ElideRight
+                                        width: Math.min(implicitWidth, 120)
+                                        verticalAlignment: Text.AlignVCenter
                                     }
                                 }
                             }
