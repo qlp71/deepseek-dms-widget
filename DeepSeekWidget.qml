@@ -46,6 +46,7 @@ PluginComponent {
     property bool   fetchRunning: false
     property string lastFetchTime: ""
     property string lastError: ""
+    property int    lastFetchTs: 0           // epoch ms of last successful data fetch
 
     // Balance
     property string balanceNormal: "—"
@@ -320,6 +321,7 @@ PluginComponent {
 
         const now = new Date()
         lastFetchTime = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        root.lastFetchTs = Date.now()
     }
 
     function _mergeHistory(existing, incoming) {
@@ -330,6 +332,9 @@ PluginComponent {
     }
 
     // ── Data fetch ────────────────────────────────────────────
+    // Every refresh re-runs fetch.py, which always re-fetches the API key list
+    // (get_api_keys) plus aggregate and per-key usage, so the key selector is
+    // never stale for longer than one refresh cycle.
     function refreshAll() {
         if (fetchRunning) return
         fetchRunning = true
@@ -341,6 +346,14 @@ PluginComponent {
             50,
             120000
         )
+    }
+
+    // Refresh when the popout opens, but only if data is older than 60s —
+    // keeps keys (and everything else) current right when the user looks.
+    function refreshIfStale() {
+        if (root.fetchRunning) return
+        if (Date.now() - root.lastFetchTs < 60000) return
+        root.refreshAll()
     }
 
     // ── Login helper ──────────────────────────────────────────
@@ -475,8 +488,15 @@ PluginComponent {
 
     popoutContent: Component {
         PopoutComponent {
+            id: popoutRoot
             headerText: tr.pluginTitle || "DeepSeek Usage"
             showCloseButton: true
+
+            // Refresh when the popout is opened (data older than 60s is stale)
+            Connections {
+                target: popoutRoot.parentPopout
+                function onOpened() { root.refreshIfStale() }
+            }
 
             Column {
                 id: contentCol
@@ -978,7 +998,7 @@ PluginComponent {
                                         const models = (d.models || []).filter(m => !m.model.toLowerCase().includes("chat"))
                                         if (models.length > 0) {
                                             return models.slice(0, 3).map((m, idx) => ({
-                                                name: m.model,
+                                                name: m.model.replace(/^deepseek/i, "DS"),
                                                 inColor: (LEGEND_COLORS[idx] || LEGEND_COLORS[0])[0],
                                                 outColor: (LEGEND_COLORS[idx] || LEGEND_COLORS[0])[1],
                                             }))
