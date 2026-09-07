@@ -113,7 +113,10 @@ PluginComponent {
     function _selectedKeyName() {
         if (root.selectedKeyId === "") return ""
         for (const k of root.apiKeys) {
-            if (k.trackingId === root.selectedKeyId) return k.name || k.trackingId
+            if (k.trackingId === root.selectedKeyId) {
+                const n = k.name || k.trackingId
+                return k.valid === false ? n + " " + (root.tr.deletedKey || "(deleted)") : n
+            }
         }
         return root.selectedKeyId
     }
@@ -293,6 +296,8 @@ PluginComponent {
         }
 
         // API keys + per-key usage cache (platform "by API key" view)
+        // Deleted keys are kept in the list (tagged valid=false) so their
+        // historical usage stays visible for cost reconciliation.
         if (o.apiKeys && Array.isArray(o.apiKeys)) {
             root.apiKeys = o.apiKeys
         }
@@ -304,7 +309,8 @@ PluginComponent {
             root.byApiKeyCache = cache
             savePluginData({ apiKeys: root.apiKeys, byApiKeyCache: cache, history: root.history })
         }
-        // Drop the selection if its key no longer exists
+        // Drop the selection only if its key is gone entirely (deleted keys
+        // stay selectable so their history can still be inspected)
         if (root.selectedKeyId !== "") {
             const found = root.apiKeys.some(k => k.trackingId === root.selectedKeyId)
             if (!found) {
@@ -730,9 +736,17 @@ PluginComponent {
 
                                         function _rebuildKeyModel() {
                                             keyModel.clear()
-                                            keyModel.append({ text: root.tr.allKeys || "All Keys", value: "" })
+                                            keyModel.append({ text: root.tr.allKeys || "All Keys", value: "", deleted: false })
+                                            // Active keys first
                                             for (const k of root.apiKeys) {
-                                                keyModel.append({ text: k.name || k.trackingId, value: k.trackingId })
+                                                if (k.valid === false) continue
+                                                keyModel.append({ text: k.name || k.trackingId, value: k.trackingId, deleted: false })
+                                            }
+                                            // Deleted / invalid keys last, marked
+                                            for (const k of root.apiKeys) {
+                                                if (k.valid !== false) continue
+                                                const n = (k.name || k.trackingId) + "  " + (root.tr.deletedKey || "(deleted)")
+                                                keyModel.append({ text: n, value: k.trackingId, deleted: true })
                                             }
                                             keySelect.currentIndex = _indexOfKey(root.selectedKeyId)
                                         }
@@ -767,8 +781,10 @@ PluginComponent {
                                             highlighted: keySelect.highlightedIndex === index
                                             contentItem: StyledText {
                                                 text: model.text
-                                                color: parent.highlighted ? Theme.primary : Theme.surfaceText
+                                                color: parent.highlighted ? Theme.primary
+                                                       : (model.deleted ? Theme.surfaceVariantText : Theme.surfaceText)
                                                 font.pixelSize: Theme.fontSizeSmall
+                                                font.italic: model.deleted
                                                 elide: Text.ElideRight
                                                 verticalAlignment: Text.AlignVCenter
                                                 leftPadding: 8

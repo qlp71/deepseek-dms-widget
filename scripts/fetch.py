@@ -320,7 +320,11 @@ def month_range_secs(year: int, month: int, tz_sec: int) -> tuple[int, int]:
 
 
 def parse_api_keys(body: str) -> list[dict]:
-    """Parse /api/v0/users/get_api_keys response -> [{trackingId, name, sensitiveId}]."""
+    """Parse /api/v0/users/get_api_keys response.
+
+    Returns [{trackingId, name, sensitiveId, valid}] — every listed key is
+    tagged valid=True (get_api_keys only returns active keys).
+    """
     try:
         o = json.loads(body)
         biz = (o.get("data") or {}).get("biz_data") or {}
@@ -336,15 +340,19 @@ def parse_api_keys(body: str) -> list[dict]:
             "trackingId": tid,
             "name": k.get("name") or tid,
             "sensitiveId": k.get("sensitive_id") or "",
+            "valid": k.get("valid", True) is not False,
         })
     return result
 
 
 def collect_key_meta_from_series(bodies: list[str]) -> dict[str, dict]:
-    """Fallback: derive {tracking_id: {trackingId, name, sensitiveId}} from by_api_key series.
+    """Fallback: derive key metadata from by_api_key series.
 
-    The by_api_key/amount response already carries api_key metadata per series,
-    so keys can be listed even if get_api_keys itself fails.
+    The by_api_key/amount response carries api_key metadata per series, so keys
+    can be listed even if get_api_keys itself fails.  Series may still include
+    recently deleted keys (api_key.valid == False) because of outstanding usage
+    records — those are KEPT but tagged valid=False so the widget can mark them
+    as deleted instead of hiding them (historical costs stay reconcilable).
     """
     meta: dict[str, dict] = {}
     for body in bodies:
@@ -365,6 +373,7 @@ def collect_key_meta_from_series(bodies: list[str]) -> dict[str, dict]:
                 "trackingId": tid,
                 "name": api_key.get("name") or tid,
                 "sensitiveId": api_key.get("sensitive_id") or "",
+                "valid": api_key.get("valid", True) is not False,
             })
     return meta
 
@@ -702,8 +711,9 @@ def main() -> int:
             by_api_key.setdefault(tid, {})[month_key] = daily
 
     if by_api_key_supported:
-        # Fallback: derive key metadata from the series themselves when
-        # get_api_keys is unavailable.
+        # Merge key metadata derived from usage series.  Recently deleted keys
+        # still appear there (valid=False) and are kept so the widget can mark
+        # them instead of dropping their historical usage/cost data.
         series_bodies = [
             (raw.get(f"byKeyAmount_{y2}_{m2}", (None, None, ""))[1] or "")
             for (y2, m2) in months_to_fetch
