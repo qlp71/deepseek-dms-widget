@@ -12,9 +12,9 @@ A [Dank Material Shell](https://github.com/Quickshell/DankMaterialShell) widget 
 - **Dual-mode daily chart** — toggle between cost (¥, single gold bars) and tokens (per-model stacked bars with input/output split)
 - **Month navigation** — browse historical months cached locally; no repeated API calls
 - **Per-model token view** — adjacent stacked bars for each model (e.g. v4-pro vs v4-flash), with distinct color pairs
-- **Official pricing** — cost derived from DeepSeek's own monthly amount/cost APIs (not hardcoded)
+- **Official costs** — daily bars use DeepSeek's grouped-by-day cost API; monthly totals use the official amount/cost responses
 - **Inline chart actions** — refresh, login (key icon), and top-up (¥ icon) in the chart header
-- **Cookie auto-login** — Playwright-powered Chromium browser automates platform login
+- **Login with your own browser** — opens your default browser and imports the Authorization header
 - **i18n** — English and Simplified Chinese (中文)
 
 ## Screenshots
@@ -25,9 +25,8 @@ A [Dank Material Shell](https://github.com/Quickshell/DankMaterialShell) widget 
 ## Requirements
 
 - [Dank Material Shell](https://github.com/Quickshell/DankMaterialShell) >= 0.1.0
-- Python 3.8+
-- pip / venv
-- A desktop environment with a web browser (for the initial login)
+- Python 3.8+ (standard library only)
+- A desktop environment with a web browser, `xdg-open`, and `zenity`
 
 ## Installation
 
@@ -35,42 +34,11 @@ A [Dank Material Shell](https://github.com/Quickshell/DankMaterialShell) widget 
 
 ```bash
 mkdir -p ~/.config/DankMaterialShell/plugins
-git clone https://github.com/gylove1994/deepseek-dms-widget.git \
+git clone https://github.com/qlp71/deepseek-dms-widget.git \
   ~/.config/DankMaterialShell/plugins/DeepSeekWidget
 ```
 
-### 2. Create a virtual environment
-
-```bash
-cd ~/.config/DankMaterialShell/plugins/DeepSeekWidget
-python3 -m venv .venv
-```
-
-### 3. Install Python dependencies
-
-```bash
-.venv/bin/pip install -r scripts/requirements.txt
-```
-
-### 4. Install Chromium for Playwright
-
-```bash
-.venv/bin/playwright install chromium
-```
-
-> **Note:** Chromium requires certain system libraries. If installation fails, install them first:
-> ```bash
-> # Arch Linux
-> sudo pacman -S --needed nss atk at-spi2-atk cups-libs libdrm libxkbcommon libxcomposite libxdamage libxrandr mesa gtk3 pango cairo alsa-lib
->
-> # Ubuntu / Debian
-> sudo apt install -y libnss3 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64
->
-> # Fedora
-> sudo dnf install -y nss atk at-spi2-atk cups-libs libdrm libxkbcommon libxcomposite libXdamage libXrandr mesa-libgbm gtk3 pango cairo alsa-lib
-> ```
-
-### 5. Enable the widget
+### 2. Enable the widget
 
 Edit `~/.config/DankMaterialShell/settings.json` and add `"deepseekWidget"` to your `barConfigs` array:
 
@@ -85,13 +53,19 @@ Edit `~/.config/DankMaterialShell/settings.json` and add `"deepseekWidget"` to y
 
 Restart Dank Material Shell or reload the configuration for the widget to appear.
 
-### 6. Log in
+### 3. Log in
 
-Click the widget in the bar to open the popout, then click the **key icon** (🔑) in the chart header. A Chromium window will open — log in with your DeepSeek Platform account. The browser closes automatically once authenticated.
+Click the widget in the bar to open the popout, then click the **key icon** (🔑) in the chart header.
 
-### Python environment
+By default (**System browser** mode):
 
-This project uses an isolated virtual environment (`.venv`). Do not install into system Python unless you explicitly intend to.
+1. Your default browser opens `platform.deepseek.com/usage`.
+2. Log in normally and open DevTools (`F12`) → **Network**.
+3. Reload the page, filter for `get_user_summary`, and select that request.
+4. Copy the complete `authorization` **request header** value (it usually starts with `Bearer`).
+5. Paste it into the secure dialog. The credential is verified and saved to `cookie.txt`.
+
+You can also do this from the plugin settings page.
 
 ### Cleanup after install
 
@@ -102,7 +76,7 @@ cd ~/.config/DankMaterialShell/plugins/DeepSeekWidget
 rm -rf .git .gitignore .superpowers screenshots README.md LICENSE
 ```
 
-Only these are required at runtime: `plugin.json`, `*.qml`, `i18n/`, `scripts/`, `.venv/`.
+Only these are required at runtime: `plugin.json`, `*.qml`, `i18n/`, and `scripts/`.
 
 ## Usage
 
@@ -110,8 +84,9 @@ Only these are required at runtime: `plugin.json`, `*.qml`, `i18n/`, `scripts/`,
 
 1. Open the widget popout by clicking the bar pill
 2. Click the **key icon** (🔑) in the chart header
-3. A Chromium browser window opens — log in to [platform.deepseek.com](https://platform.deepseek.com)
-4. Once logged in, the browser closes automatically and data loads
+3. Log in with your default browser when it opens
+4. Copy the `authorization` request header from DevTools and paste it into the prompt
+5. The credential is verified, saved, and data loads
 
 ### Bar Pill
 
@@ -139,7 +114,7 @@ Click the bar pill to open the full panel with:
 ### Settings
 
 Configure via the DMS settings panel:
-- **Refresh interval** — 1/5/15/30 minutes
+- **Refresh interval** — 5/15/30/60 minutes (default 15 minutes)
 - **Trend history months** — 1/3/6 months
 - **Language** — English / 中文
 
@@ -152,7 +127,8 @@ The widget calls DeepSeek Platform's internal APIs using your session cookie:
 | `/api/v0/users/get_user_summary` | Balance, monthly summary |
 | `/api/v0/usage/amount` | Token usage breakdown (monthly) |
 | `/api/v0/usage/amount?group_by=day` | Daily per-model token usage |
-| `/api/v0/usage/cost` | Cost breakdown (monthly, for pricing derivation) |
+| `/api/v0/usage/cost` | Monthly cost breakdown |
+| `/api/v0/usage/cost?group_by=day` | Official daily cost breakdown (used for chart bars) |
 | `/api/v0/users/get_api_keys` | API key list (names + tracking ids) |
 | `/api/v0/usage/by_api_key/amount?start=S&end=E&tz=Z` | Per-API-key usage buckets |
 | `/api/v0/usage/by_api_key/cost?start=S&end=E&tz=Z` | Per-API-key cost buckets |
@@ -164,11 +140,11 @@ are unavailable (404, older platform version), the widget simply hides the key
 selector. Note that balance is account-wide — all keys share the same wallet —
 so only usage and cost are broken down per key.
 
-Pricing is derived from DeepSeek's own monthly cost ÷ token counts per model and token type, so it always matches the official platform regardless of peak/off-peak changes.
+Daily chart costs come directly from DeepSeek's grouped-by-day cost endpoint, so they match the platform even if pricing changes during a month. A monthly-average pricing calculation is retained only as a fallback for older platforms that do not expose the daily cost endpoint.
 
-The cookie is obtained by launching a Chromium browser via Playwright, intercepting the authenticated request after you log in. The cookie is stored locally in `cookie.txt` (gitignored).
+The widget opens your normal browser and imports the `authorization` header you copy from DevTools. The credential is stored locally in `cookie.txt` (gitignored).
 
-Historical daily data is cached in pluginData (`dailyCache`) so only the current month is fetched from the API on each refresh.
+Historical daily data is cached in pluginData (`dailyCache`). After the configured history is cached, regular refreshes only fetch the current month. Opening the popout will not bypass the configured refresh interval. If a refresh partially fails (for example on a transient 429/5xx), the widget keeps the last known-good snapshot instead of overwriting it with zero or empty values.
 
 ## Project Structure
 
@@ -181,8 +157,7 @@ Historical daily data is cached in pluginData (`dailyCache`) so only the current
 │   └── zh_CN.json           # Chinese strings
 ├── scripts/
 │   ├── fetch.py             # API data fetcher
-│   ├── login.py             # Playwright cookie login
-│   └── requirements.txt     # Python dependencies
+│   └── login.py             # System-browser credential import
 └── screenshots/
     ├── cost-money.png       # Cost chart mode
     └── cost-token.png       # Tokens chart mode

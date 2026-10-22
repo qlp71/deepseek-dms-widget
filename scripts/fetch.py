@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,22 +38,55 @@ HEADERS_TEMPLATE = {
 }
 
 
-def fetch_url(url: str, credential: str, timeout: int = 30) -> tuple[int | None, str | None, str | None]:
+def fetch_url(
+    url: str,
+    credential: str,
+    timeout: int = 30,
+    retries: int = 3,
+) -> tuple[int | None, str | None, str | None]:
+    """Fetch a URL, retrying transient network/HTTP failures.
+
+    The platform occasionally returns a 429/5xx or drops a connection while
+    the widget is refreshing.  A single failed request used to turn one of the
+    month series into an empty/zero value, which made the displayed totals
+    disagree with each other.  Retry a couple of times with a short backoff.
+    """
     # credential may be a Cookie string or "Bearer ..." Authorization header
     if credential.startswith("Bearer ") or credential.startswith("bearer "):
         headers = {**HEADERS_TEMPLATE, "Authorization": credential}
     else:
         headers = {**HEADERS_TEMPLATE, "Cookie": credential}
     req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8"), None
-    except HTTPError as e:
-        return e.code, None, f"HTTP {e.code}"
-    except URLError as e:
-        return None, None, str(e.reason)
-    except Exception as e:
-        return None, None, str(e)
+
+    last_error: str | None = None
+    for attempt in range(retries + 1):
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read().decode("utf-8"), None
+        except HTTPError as e:
+            last_error = f"HTTP {e.code}"
+            # Retry throttling and server-side failures only.  Auth/404 errors
+            # are deterministic and should be surfaced immediately.
+            if e.code not in (429, 500, 502, 503, 504) or attempt >= retries:
+                return e.code, None, last_error
+            retry_after = None
+            try:
+                retry_after = float(e.headers.get("Retry-After") or 0)
+            except (AttributeError, TypeError, ValueError):
+                pass
+            if retry_after and retry_after > 0:
+                time.sleep(min(retry_after, 10.0))
+                continue
+        except URLError as e:
+            last_error = str(e.reason)
+            if attempt >= retries:
+                return None, None, last_error
+        except Exception as e:
+            last_error = str(e)
+            if attempt >= retries:
+                return None, None, last_error
+        time.sleep(0.7 * (2 ** attempt))
+    return None, None, last_error or "request failed"
 
 
 def is_auth_expired(body: str) -> bool:
@@ -67,145 +101,216 @@ def is_auth_expired(body: str) -> bool:
     return False
 
 
-def extract_biz_data(body: str) -> dict | None:
+def extract_biz_data(body: str) -> dict | list | None:
+    """Return the API's ``biz_data`` payload (dict or list), if present."""
     try:
         o = json.loads(body)
-        data = o.get("data", {})
-        if isinstance(data, dict):
-            return data.get("biz_data") or data
-        return None
+        data = o.get("data")
+        if not isinstance(data, dict):
+            return None
+        if "biz_data" in data:
+            return data.get("biz_data")
+        return data
     except Exception:
         return None
 
 
-def parse_total_tokens(biz_data: dict) -> tuple[int, int]:
-    """Sum input/output tokens from the 'total' array in amount API response."""
+def _as_int(value) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _iter_total_entries(biz_data) -> list[dict]:
+    """Extract model/usage entries from all known API response shapes.
+
+    The monthly endpoints currently return ``{total: [...]}``, while the
+    group-by-day cost endpoint wraps that object in a one-element list.  Older
+    platform versions occasionally returned a flat list of period objects.
+    Normalize all of those here so every parser follows the same rules.
+    """
+    if isinstance(biz_data, dict):
+        total = biz_data.get("total")
+        return [e for e in total if isinstance(e, dict)] if isinstance(total, list) else []
+    if isinstance(biz_data, list):
+        entries: list[dict] = []
+        for item in biz_data:
+            if not isinstance(item, dict):
+                continue
+            total = item.get("total")
+            if isinstance(total, list):
+                entries.extend(e for e in total if isinstance(e, dict))
+            elif "model" in item:
+                # Already a flat model entry.
+                entries.append(item)
+        return entries
+    return []
+
+
+def _usage_amounts(model_entry: dict) -> dict[str, int]:
+    usage = model_entry.get("usage") or []
+    if not isinstance(usage, list):
+        return {}
+    return {
+        str(u.get("type", "")): _as_int(u.get("amount"))
+        for u in usage
+        if isinstance(u, dict)
+    }
+
+
+def _prompt_tokens(amounts: dict[str, int]) -> int:
+    """Return prompt tokens without double-counting aggregate + split fields.
+
+    Newer responses expose cache-hit/cache-miss prompt tokens.  Some older
+    responses only expose ``PROMPT_TOKEN``.  If both are present, the two
+    cache fields are the precise breakdown and ``PROMPT_TOKEN`` is an
+    aggregate/legacy field, so prefer the split fields.
+    """
+    split = amounts.get("PROMPT_CACHE_HIT_TOKEN", 0) + amounts.get("PROMPT_CACHE_MISS_TOKEN", 0)
+    return split if split > 0 else amounts.get("PROMPT_TOKEN", 0)
+
+
+def _iter_daily_entries(biz_data) -> list[dict]:
+    """Extract day objects from grouped amount/cost API responses."""
+    if isinstance(biz_data, dict):
+        days = biz_data.get("days")
+        return [d for d in days if isinstance(d, dict)] if isinstance(days, list) else []
+    if isinstance(biz_data, list):
+        days: list[dict] = []
+        for item in biz_data:
+            if not isinstance(item, dict):
+                continue
+            nested = item.get("days")
+            if isinstance(nested, list):
+                days.extend(d for d in nested if isinstance(d, dict))
+            elif "date" in item or "day" in item:
+                days.append(item)
+        return days
+    return []
+
+
+def _day_number(day_entry: dict) -> int | None:
+    date_str = str(day_entry.get("date") or "")
+    if date_str:
+        try:
+            return int(date_str.split("-")[2])
+        except (IndexError, ValueError):
+            pass
+    try:
+        day = day_entry.get("day")
+        return int(day) if day is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_total_tokens(biz_data) -> tuple[int, int]:
+    """Sum input/output tokens from the 'total' entries of an amount response."""
     inp = out = 0
-    for model_entry in biz_data.get("total", []):
-        for u in model_entry.get("usage", []):
-            t, amt = u.get("type", ""), int(u.get("amount", 0))
-            if t in ("PROMPT_CACHE_HIT_TOKEN", "PROMPT_CACHE_MISS_TOKEN"):
-                inp += amt
-            elif t == "RESPONSE_TOKEN":
-                out += amt
+    for model_entry in _iter_total_entries(biz_data):
+        amounts = _usage_amounts(model_entry)
+        inp += _prompt_tokens(amounts)
+        out += amounts.get("RESPONSE_TOKEN", 0)
     return inp, out
 
 
-def parse_total_cost(biz_data_list: list) -> str:
-    """Sum all cost amounts from cost API biz_data (list of {total:[{model,usage}]})."""
+def parse_total_cost(biz_data) -> str:
+    """Sum all cost amounts from any supported monthly cost response shape."""
     total = 0.0
-    for period in biz_data_list:
-        for model_entry in period.get("total", []):
-            for u in model_entry.get("usage", []):
-                try:
-                    total += float(u.get("amount", 0))
-                except (TypeError, ValueError):
-                    pass
+    for model_entry in _iter_total_entries(biz_data):
+        for u in model_entry.get("usage") or []:
+            if isinstance(u, dict):
+                total += _as_float(u.get("amount"))
     return f"{total:.10f}" if total > 0 else "0"
 
 
 def build_pricing_map(amount_body: str, cost_body: str) -> dict:
-    """Derive exact per-model, per-token-type pricing from monthly API responses.
+    """Derive per-model, per-token-type pricing from monthly API responses.
 
-    Uses the ACTUAL cost and token counts reported by DeepSeek to compute
-    the price per token for each (model, token_type) combination.  This
-    automatically adapts to peak/off-peak pricing changes.
-
-    Returns {(model, token_type): price_per_token} (yuan per single token).
+    Kept as a fallback for platforms/endpoints where the official grouped-by-
+    day cost response is unavailable.
     """
-    # ── Extract token counts from monthly amount response ──────
     token_counts: dict[tuple[str, str], int] = {}
-    try:
-        a_o = json.loads(amount_body)
-        a_biz = (a_o.get("data") or {}).get("biz_data") or {}
-        for model_entry in a_biz.get("total", []):
-            model = model_entry.get("model", "unknown")
-            for u in model_entry.get("usage", []):
-                t = u.get("type", "")
-                amt = int(u.get("amount", 0))
-                if amt > 0:
-                    token_counts[(model, t)] = amt
-    except Exception:
-        pass
+    for model_entry in _iter_total_entries(extract_biz_data(amount_body)):
+        model = model_entry.get("model", "unknown")
+        for token_type, amt in _usage_amounts(model_entry).items():
+            if amt > 0:
+                token_counts[(model, token_type)] = amt
 
-    # ── Extract costs from monthly cost response ────────────────
     cost_map: dict[tuple[str, str], float] = {}
-    try:
-        c_o = json.loads(cost_body)
-        c_biz = (c_o.get("data") or {}).get("biz_data") or {}
-        entries = c_biz if isinstance(c_biz, list) else [c_biz]
-        for entry in entries:
-            for model_entry in entry.get("total", []):
-                model = model_entry.get("model", "unknown")
-                for u in model_entry.get("usage", []):
-                    t = u.get("type", "")
-                    try:
-                        amt = float(u.get("amount", 0))
-                    except (ValueError, TypeError):
-                        amt = 0.0
-                    if amt > 0:
-                        cost_map[(model, t)] = cost_map.get((model, t), 0.0) + amt
-    except Exception:
-        pass
+    for model_entry in _iter_total_entries(extract_biz_data(cost_body)):
+        model = model_entry.get("model", "unknown")
+        for token_type, amt in _usage_amounts(model_entry).items():
+            if amt > 0:
+                cost_map[(model, token_type)] = cost_map.get((model, token_type), 0.0) + amt
 
-    # ── Derive per-token pricing ────────────────────────────────
     pricing: dict[tuple[str, str], float] = {}
     for key, tokens in token_counts.items():
         cost = cost_map.get(key, 0)
         if tokens > 0 and cost > 0:
             pricing[key] = cost / tokens
-
     return pricing
 
 
-def parse_daily(body: str, cur_day: int, pricing_map: dict | None = None) -> list[dict]:
-    """Parse group_by=day amount response into [{day, inputTokens, outputTokens, cost}].
+def parse_daily(
+    body: str,
+    cur_day: int,
+    pricing_map: dict | None = None,
+    cost_by_day: dict[int, dict] | None = None,
+) -> list[dict]:
+    """Parse a group-by-day amount response into the widget's daily shape.
 
-    Cost is computed from per-token-type counts × the pricing map derived
-    from the official monthly cost/amount APIs, so it always matches what
-    the DeepSeek platform reports.
+    When ``cost_by_day`` is supplied (parsed from the official group_by=day
+    cost endpoint), those exact model/day costs are used.  The pricing-map
+    calculation is kept only as a fallback for older platforms that do not
+    expose the daily cost endpoint.
     """
-    try:
-        o = json.loads(body)
-        biz = (o.get("data") or {}).get("biz_data") or {}
-        days_raw = biz.get("days", [])
-    except Exception:
-        return []
+    days_raw = _iter_daily_entries(extract_biz_data(body))
 
     if pricing_map is None:
         pricing_map = {}
+    cost_by_day = cost_by_day or {}
 
     result = []
     for d in days_raw:
-        date_str = d.get("date", "")
-        try:
-            day_num = int(date_str.split("-")[2])
-        except Exception:
-            continue
-        if day_num > cur_day:
+        day_num = _day_number(d)
+        if day_num is None or day_num > cur_day:
             continue
         inp = out = 0
         day_cost = 0.0
         models = []  # per-model breakdown
         for model_entry in d.get("data", []):
-            model = model_entry.get("model", "unknown")
-            # Skip deprecated "chat" family models
-            if "chat" in model.lower():
+            if not isinstance(model_entry, dict):
                 continue
-            m_inp = 0
-            m_out = 0
-            m_cost = 0.0
-            for u in model_entry.get("usage", []):
-                t = u.get("type", "")
-                amt = int(u.get("amount", 0))
-                if t in ("PROMPT_CACHE_HIT_TOKEN", "PROMPT_CACHE_MISS_TOKEN", "PROMPT_TOKEN"):
-                    m_inp += amt
-                elif t == "RESPONSE_TOKEN":
-                    m_out += amt
-                # Look up exact per-token price from official data
-                price = pricing_map.get((model, t))
-                if price is not None and price > 0 and amt > 0:
-                    m_cost += amt * price
+            model = model_entry.get("model", "unknown")
+            amounts = _usage_amounts(model_entry)
+            m_inp = _prompt_tokens(amounts)
+            m_out = amounts.get("RESPONSE_TOKEN", 0)
+            official_day = cost_by_day.get(day_num)
+            if official_day is not None:
+                m_cost = _as_float((official_day.get("models") or {}).get(model))
+            else:
+                m_cost = 0.0
+                # Fallback: derive from monthly per-token-type prices.  Avoid
+                # adding PROMPT_TOKEN when the split fields already exist.
+                for token_type, amt in amounts.items():
+                    if amt <= 0:
+                        continue
+                    if token_type == "PROMPT_TOKEN" and (
+                        amounts.get("PROMPT_CACHE_HIT_TOKEN", 0) > 0
+                        or amounts.get("PROMPT_CACHE_MISS_TOKEN", 0) > 0
+                    ):
+                        continue
+                    price = pricing_map.get((model, token_type))
+                    if price is not None and price > 0:
+                        m_cost += amt * price
             inp += m_inp
             out += m_out
             day_cost += m_cost
@@ -215,6 +320,11 @@ def parse_daily(body: str, cur_day: int, pricing_map: dict | None = None) -> lis
                 "outputTokens": m_out,
                 "cost": round(m_cost, 6),
             })
+
+        official_day = cost_by_day.get(day_num)
+        if official_day is not None:
+            day_cost = _as_float(official_day.get("total"))
+
         result.append({
             "day": day_num,
             "inputTokens": inp,
@@ -225,75 +335,45 @@ def parse_daily(body: str, cur_day: int, pricing_map: dict | None = None) -> lis
     return result
 
 
-def parse_daily_cost(body: str, cur_day: int) -> list[dict]:
-    """Parse group_by=day cost response into [{day, cost}].
+def parse_daily_cost(body: str, cur_day: int) -> dict[int, dict]:
+    """Parse the group_by=day cost response.
 
-    Supports multiple response shapes the DeepSeek cost API may return:
-      - biz_data.days[] with {date, data: [{model, usage:[{type, amount}]}]}
-      - biz_data as a flat list of {date, total: [{model, usage:[{type, amount}]}]}
-      - biz_data as a flat list of {date, amount} (simplified)
+    Returns ``{day: {"total": float, "models": {model: float}}}``.  The current
+    platform wraps the day list in a one-element ``biz_data`` list; older
+    responses used a dict/days shape or a flat list.  ``_iter_daily_entries``
+    normalizes all of them.
     """
-    try:
-        o = json.loads(body)
-        biz = (o.get("data") or {}).get("biz_data") or {}
-    except Exception:
-        return []
-
-    # Shape 1: {days: [...]}
-    if isinstance(biz, dict):
-        days_raw = biz.get("days", [])
-        if not days_raw:
-            # Maybe the dict itself has date keys
-            days_raw = list(biz.values()) if biz else []
-    # Shape 2: flat list [{date, ...}, ...]
-    elif isinstance(biz, list):
-        days_raw = biz
-    else:
-        return []
-
-    result = []
+    days_raw = _iter_daily_entries(extract_biz_data(body))
+    result: dict[int, dict] = {}
     for d in days_raw:
-        if not isinstance(d, dict):
-            continue
-        date_str = d.get("date", "")
-        try:
-            day_num = int(date_str.split("-")[2])
-        except Exception:
-            # Try 'day' key as fallback
-            day_num = d.get("day")
-            if day_num is None:
-                continue
-        if day_num > cur_day:
+        day_num = _day_number(d)
+        if day_num is None or day_num > cur_day:
             continue
 
-        total_cost = 0.0
-        # Format A: nested {data: [{model, usage:[{type, amount}]}]}
-        entries = d.get("data", [])
-        if entries:
+        model_costs: dict[str, float] = {}
+        entries = d.get("data")
+        if not isinstance(entries, list) or not entries:
+            entries = d.get("total")
+        if isinstance(entries, list) and entries:
             for model_entry in entries:
-                for u in model_entry.get("usage", []):
-                    try:
-                        total_cost += float(u.get("amount", 0))
-                    except (TypeError, ValueError):
-                        pass
+                if not isinstance(model_entry, dict):
+                    continue
+                model = model_entry.get("model", "unknown")
+                model_cost = sum(
+                    _as_float(u.get("amount"))
+                    for u in (model_entry.get("usage") or [])
+                    if isinstance(u, dict)
+                )
+                model_costs[model] = model_costs.get(model, 0.0) + model_cost
+            total_cost = sum(model_costs.values())
         else:
-            # Format B: {total: [{model, usage:[{type, amount}]}]}
-            total_entries = d.get("total", [])
-            for model_entry in total_entries:
-                for u in model_entry.get("usage", []):
-                    try:
-                        total_cost += float(u.get("amount", 0))
-                    except (TypeError, ValueError):
-                        pass
-            # Format C: direct {amount: "0.123"} or {cost: "0.123"}
-            if total_cost == 0:
-                direct = d.get("amount") or d.get("cost") or 0
-                try:
-                    total_cost = float(direct)
-                except (TypeError, ValueError):
-                    pass
+            # Simplified legacy shape: {date, amount} / {date, cost}.
+            total_cost = _as_float(d.get("amount") if d.get("amount") is not None else d.get("cost"))
 
-        result.append({"day": day_num, "cost": round(total_cost, 6)})
+        result[day_num] = {
+            "total": round(total_cost, 10),
+            "models": {model: round(cost, 10) for model, cost in model_costs.items()},
+        }
 
     return result
 
@@ -416,19 +496,18 @@ def parse_by_api_key_amount(body: str, tz_sec: int, cur_day: int) -> dict[str, d
             if day_num > cur_day:
                 continue
             usage = b.get("usage") or {}
-            try:
-                hit = int(usage.get("PROMPT_CACHE_HIT_TOKEN") or 0)
-                miss = int(usage.get("PROMPT_CACHE_MISS_TOKEN") or 0)
-                out = int(usage.get("RESPONSE_TOKEN") or 0)
-            except (TypeError, ValueError):
-                hit = miss = out = 0
-            if hit == 0 and miss == 0 and out == 0:
+            if not isinstance(usage, dict):
+                continue
+            amounts = {str(k): _as_int(v) for k, v in usage.items()}
+            inp = _prompt_tokens(amounts)
+            out = amounts.get("RESPONSE_TOKEN", 0)
+            if inp == 0 and out == 0:
                 continue
             day = result.setdefault(tid, {}).setdefault(day_num, {"inp": 0, "out": 0, "models": {}})
-            day["inp"] += hit + miss
+            day["inp"] += inp
             day["out"] += out
             m = day["models"].setdefault(model, {"inp": 0, "out": 0})
-            m["inp"] += hit + miss
+            m["inp"] += inp
             m["out"] += out
     return result
 
@@ -521,10 +600,12 @@ def main() -> int:
         return 1
     credential = cookie
 
-    now = datetime.now(timezone.utc)
-    cur_year, cur_month = now.year, now.month
+    # The platform UI and the user see local calendar months.  Using UTC here
+    # made the widget jump to the previous month (and mix month boundaries) for
+    # users east of UTC during the first hours of each month.
+    local_now = datetime.now().astimezone()
+    cur_year, cur_month = local_now.year, local_now.month
     tz_sec = get_tz_sec()
-    local_now = datetime.now()  # for capping "future" days in the current month
     local_day = local_now.day
 
     # Build list of months to fetch (oldest first)
@@ -537,20 +618,19 @@ def main() -> int:
             m = 12
             y -= 1
 
-    # Build URL map
+    # Build URL map.  The grouped-by-day amount/cost responses also contain
+    # the monthly total, so one request per endpoint covers both the summary
+    # card and the daily chart.  This halves request volume and avoids the
+    # platform's aggressive 429 throttling.
     urls: dict[str, str] = {
         "summary": f"{BASE}/api/v0/users/get_user_summary",
-        "daily": f"{BASE}/api/v0/usage/amount?year={cur_year}&month={cur_month}&group_by=day",
-        "dailyCost": f"{BASE}/api/v0/usage/cost?year={cur_year}&month={cur_month}&group_by=day",
         "apiKeys": f"{BASE}/api/v0/users/get_api_keys",
     }
     for (y2, m2) in months_to_fetch:
         key_a = f"amount_{y2}_{m2}"
         key_c = f"cost_{y2}_{m2}"
-        key_daily = f"daily_{y2}_{m2}"
-        urls[key_a] = f"{BASE}/api/v0/usage/amount?year={y2}&month={m2}"
-        urls[key_c] = f"{BASE}/api/v0/usage/cost?year={y2}&month={m2}"
-        urls[key_daily] = f"{BASE}/api/v0/usage/amount?year={y2}&month={m2}&group_by=day"
+        urls[key_a] = f"{BASE}/api/v0/usage/amount?year={y2}&month={m2}&group_by=day"
+        urls[key_c] = f"{BASE}/api/v0/usage/cost?year={y2}&month={m2}&group_by=day"
         # Per-API-key usage/cost (platform "by API key" view): epoch range + tz
         s_sec, e_sec = month_range_secs(y2, m2, tz_sec)
         urls[f"byKeyAmount_{y2}_{m2}"] = f"{BASE}/api/v0/usage/by_api_key/amount?start={s_sec}&end={e_sec}&tz={tz_sec}"
@@ -558,7 +638,7 @@ def main() -> int:
 
     # Concurrent fetch
     raw: dict[str, tuple[int | None, str | None, str | None]] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futs = {pool.submit(fetch_url, url, credential): label for label, url in urls.items()}
         for fut in as_completed(futs):
             label = futs[fut]
@@ -570,120 +650,117 @@ def main() -> int:
     )
 
     output: dict = {"ok": True, "authExpired": auth_expired}
-    errors: list[str] = []
+    errors: list[str] = []    # aggregate/current data failures: block commit
+    warnings: list[str] = []  # optional data failures: keep the good parts
 
-    # Parse summary
+    # Parse summary.  Balance is useful but not required for the usage chart,
+    # so a transient summary failure must not hide otherwise valid usage data.
     s_code, s_body, s_err = raw.get("summary", (None, None, "not fetched"))
     if s_err:
-        errors.append(f"summary: {s_err}")
+        warnings.append(f"summary: {s_err}")
         output["balance"] = None
     elif s_code != 200:
-        errors.append(f"summary: HTTP {s_code}")
+        warnings.append(f"summary: HTTP {s_code}")
         output["balance"] = None
     else:
         biz = extract_biz_data(s_body or "")
-        if biz:
-            normal_wallets = biz.get("normal_wallets", [])
-            bonus_wallets = biz.get("bonus_wallets", [])
+        if isinstance(biz, dict):
+            normal_wallets = biz.get("normal_wallets") or []
+            bonus_wallets = biz.get("bonus_wallets") or []
             normal = normal_wallets[0] if normal_wallets else {}
             bonus = bonus_wallets[0] if bonus_wallets else {}
             output["balance"] = {
                 "currency": normal.get("currency", "CNY"),
                 "normal": normal.get("balance", "0"),
                 "bonus": bonus.get("balance", "0"),
-                "tokenEstimation": biz.get("total_available_token_estimation", "0"),
+                # The current summary shape exposes token_estimation per wallet
+                # and no longer exposes the old monthly_* fields.  Keep those
+                # optional for older platform versions.
+                "tokenEstimation": normal.get(
+                    "token_estimation",
+                    biz.get("total_available_token_estimation", "0"),
+                ),
                 "monthlyTokenUsage": biz.get("monthly_token_usage", "0"),
                 "monthlyCosts": biz.get("monthly_costs", []),
+                "totalCosts": biz.get("total_costs", []),
             }
         else:
-            errors.append("summary: unexpected response format")
+            warnings.append("summary: unexpected response format")
             output["balance"] = None
 
-    # Parse amount + cost per month
+    # Parse amount + cost and build the daily chart from the same responses.
     history: list[dict] = []
-    pricing_map: dict = {}  # derived from current month's official data
+    daily_by_month: dict[str, list[dict]] = {}
     for (y2, m2) in months_to_fetch:
+        month_key = f"{y2}-{m2}"
+        is_current = (y2 == cur_year and m2 == cur_month)
+        day_limit = local_day if is_current else 31
         key_a = f"amount_{y2}_{m2}"
         key_c = f"cost_{y2}_{m2}"
 
         a_code, a_body, a_err = raw.get(key_a, (None, None, "not fetched"))
         c_code, c_body, c_err = raw.get(key_c, (None, None, "not fetched"))
+        biz_a = extract_biz_data(a_body or "") if (not a_err and a_code == 200) else None
+        biz_c = extract_biz_data(c_body or "") if (not c_err and c_code == 200) else None
 
         entry: dict = {"year": y2, "month": m2, "inputTokens": 0, "outputTokens": 0, "cost": "0"}
+        if isinstance(biz_a, (dict, list)):
+            total_entries = _iter_total_entries(biz_a)
+            if total_entries:
+                entry["inputTokens"], entry["outputTokens"] = parse_total_tokens(biz_a)
+            elif isinstance(biz_a, dict):
+                # fallback: old flat structure
+                entry["inputTokens"] = _as_int(biz_a.get("prompt_tokens") or biz_a.get("input_tokens"))
+                entry["outputTokens"] = _as_int(biz_a.get("completion_tokens") or biz_a.get("output_tokens"))
 
-        if not a_err and a_code == 200:
-            biz_a = extract_biz_data(a_body or "")
-            if isinstance(biz_a, dict):
-                if "total" in biz_a:
-                    # new structure: {total: [{model, usage:[{type,amount}]}], days:[...]}
-                    entry["inputTokens"], entry["outputTokens"] = parse_total_tokens(biz_a)
-                else:
-                    # fallback: old flat structure
-                    entry["inputTokens"] = int(biz_a.get("prompt_tokens") or biz_a.get("input_tokens") or 0)
-                    entry["outputTokens"] = int(biz_a.get("completion_tokens") or biz_a.get("output_tokens") or 0)
-
-        if not c_err and c_code == 200:
-            biz_c = extract_biz_data(c_body or "")
-            if isinstance(biz_c, list):
-                entry["cost"] = parse_total_cost(biz_c)
-            elif isinstance(biz_c, dict):
+        if isinstance(biz_c, (dict, list)):
+            entry["cost"] = parse_total_cost(biz_c)
+            if entry["cost"] == "0" and isinstance(biz_c, dict):
                 costs = biz_c.get("costs") or biz_c.get("monthly_costs") or []
                 if costs:
                     entry["cost"] = str(costs[0].get("amount", "0"))
                 elif isinstance(biz_c.get("amount"), (int, float, str)):
                     entry["cost"] = str(biz_c["amount"])
 
-        is_current = (y2 == cur_year and m2 == cur_month)
-        if is_current:
-            output["current"] = entry
-            # Derive exact per-model per-token-type pricing from official monthly
-            # amount + cost data so daily costs match the platform exactly.
-            if not a_err and a_code == 200 and not c_err and c_code == 200:
-                pricing_map = build_pricing_map(a_body or "", c_body or "")
+        month_ok = isinstance(biz_a, (dict, list)) and isinstance(biz_c, (dict, list))
+        daily_ok = False
+        if month_ok:
+            # Official daily cost is present in the same grouped-by-day cost
+            # response.  Pricing-map derivation is only a compatibility
+            # fallback when an older platform omits the day list.
+            cost_by_day = parse_daily_cost(c_body or "", day_limit)
+            monthly_pricing = build_pricing_map(a_body or "", c_body or "")
+            if cost_by_day:
+                daily_data = parse_daily(a_body or "", day_limit, monthly_pricing, cost_by_day)
+            else:
+                daily_data = parse_daily(a_body or "", day_limit, monthly_pricing)
+                warnings.append(f"dailyCost_{month_key}: missing day cost data; used fallback")
+            if daily_data:
+                daily_by_month[month_key] = daily_data
+                if is_current:
+                    output["daily"] = daily_data
+                daily_ok = True
+
+        if month_ok and daily_ok:
+            if is_current:
+                output["current"] = entry
+            else:
+                history.append(entry)
         else:
-            history.append(entry)
+            reason = a_err or c_err or f"HTTP {a_code}/{c_code}" or "unexpected response format"
+            msg = f"month_{month_key}: {reason}"
+            if is_current:
+                errors.append(msg)
+            else:
+                warnings.append(msg)
 
     output["history"] = history
-
-    # Parse daily breakdown for ALL months (with group_by=day)
-    daily_by_month: dict[str, list[dict]] = {}
-    for (y2, m2) in months_to_fetch:
-        month_key = f"{y2}-{m2}"
-        is_current = (y2 == cur_year and m2 == cur_month)
-        day_limit = local_day if is_current else 31  # cap future days for current month only
-        key_daily = f"daily_{y2}_{m2}"
-        d_code, d_body, d_err = raw.get(key_daily, (None, None, "not fetched"))
-
-        # For non-current months, rebuild pricing from their own monthly data
-        month_pricing = pricing_map if is_current else {}
-        if not is_current:
-            key_a = f"amount_{y2}_{m2}"
-            key_c = f"cost_{y2}_{m2}"
-            a_code2, a_body2, a_err2 = raw.get(key_a, (None, None, "not fetched"))
-            c_code2, c_body2, c_err2 = raw.get(key_c, (None, None, "not fetched"))
-            if not a_err2 and a_code2 == 200 and not c_err2 and c_code2 == 200:
-                month_pricing = build_pricing_map(a_body2 or "", c_body2 or "")
-
-        if not d_err and d_code == 200:
-            daily_data = parse_daily(d_body or "", day_limit, month_pricing)
-            daily_by_month[month_key] = daily_data
-            if is_current:
-                output["daily"] = daily_data
-        else:
-            daily_by_month[month_key] = []
-            if is_current:
-                output["daily"] = []
-            if d_err:
-                errors.append(f"daily_{month_key}: {d_err}")
-
     output["dailyByMonth"] = daily_by_month
 
     # ── Per-API-key usage (platform "by API key" view) ───────────────
-    output["apiKeys"] = []
-    output["byApiKey"] = {}
-
     k_code, k_body, k_err = raw.get("apiKeys", (None, None, "not fetched"))
-    api_keys = parse_api_keys(k_body or "") if (not k_err and k_code == 200) else []
+    api_keys_ok = (not k_err and k_code == 200)
+    api_keys = parse_api_keys(k_body or "") if api_keys_ok else []
 
     by_api_key: dict[str, dict] = {}
     by_api_key_supported = True
@@ -701,8 +778,7 @@ def main() -> int:
             by_api_key_supported = False
             break
         if a_err or c_err or a_code != 200 or c_code != 200:
-            if is_current:
-                errors.append(f"by_api_key_{month_key}: amount={a_err or a_code} cost={c_err or c_code}")
+            warnings.append(f"by_api_key_{month_key}: amount={a_err or a_code} cost={c_err or c_code}")
             continue
 
         amount_map = parse_by_api_key_amount(a_body or "", tz_sec, day_limit)
@@ -710,26 +786,32 @@ def main() -> int:
         for tid, daily in merge_by_api_key(amount_map, cost_map).items():
             by_api_key.setdefault(tid, {})[month_key] = daily
 
-    if by_api_key_supported:
-        # Merge key metadata derived from usage series.  Recently deleted keys
-        # still appear there (valid=False) and are kept so the widget can mark
-        # them instead of dropping their historical usage/cost data.
-        series_bodies = [
-            (raw.get(f"byKeyAmount_{y2}_{m2}", (None, None, ""))[1] or "")
-            for (y2, m2) in months_to_fetch
-        ]
-        known = {k["trackingId"] for k in api_keys}
-        for tid, meta in collect_key_meta_from_series(series_bodies).items():
-            if tid not in known:
-                api_keys.append(meta)
+    # Merge key metadata derived from usage series.  Recently deleted keys
+    # still appear there (valid=False) and are kept so the widget can mark
+    # them instead of dropping their historical usage/cost data.  Keep the key
+    # list independent from optional per-key usage requests: a 429 on the
+    # by_api_key endpoints must not hide the selector itself.
+    series_bodies = [
+        (raw.get(f"byKeyAmount_{y2}_{m2}", (None, None, ""))[1] or "")
+        for (y2, m2) in months_to_fetch
+    ]
+    known = {k["trackingId"] for k in api_keys}
+    for tid, meta in collect_key_meta_from_series(series_bodies).items():
+        if tid not in known:
+            api_keys.append(meta)
+    # Only publish if we actually obtained the list (or fallback metadata).
+    # On total failure, leave the widget's existing selector untouched.
+    if api_keys_ok or api_keys:
         output["apiKeys"] = api_keys
+    if by_api_key_supported and by_api_key:
         output["byApiKey"] = by_api_key
 
-    if errors:
-        output["ok"] = False
-        output["error"] = "; ".join(errors)
-    else:
-        output["error"] = None
+    if auth_expired:
+        errors.append("authentication expired")
+
+    output["ok"] = not errors
+    output["error"] = "; ".join(errors) if errors else None
+    output["warning"] = "; ".join(warnings) if warnings else None
 
     print(json.dumps(output, ensure_ascii=False))
     return 0 if output["ok"] else 1

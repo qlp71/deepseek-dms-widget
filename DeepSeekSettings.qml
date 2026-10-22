@@ -9,6 +9,10 @@ PluginSettings {
     pluginId: "deepseekWidget"
 
     readonly property string _pluginDir: Qt.resolvedUrl(".").toString().replace("file://", "")
+    readonly property string _cookieFile: _pluginDir + "cookie.txt"
+    readonly property string _loginScript: _pluginDir + "scripts/login.py"
+    property bool loginRunning: false
+    property string loginMessage: ""
 
     property var tr: ({})
     function _loadI18n() {
@@ -29,12 +33,33 @@ PluginSettings {
 
     property bool cookieExists: false
     function _checkCookie() {
-        const path = _pluginDir + "cookie.txt"
         Proc.runCommand(
             "deepseekWidget.settings.cookieCheck",
-            ["test", "-f", path],
+            ["test", "-f", _cookieFile],
             (stdout, exitCode) => { cookieExists = (exitCode === 0) },
             0, 3000
+        )
+    }
+
+    function _runLogin() {
+        if (loginRunning) return
+        loginRunning = true
+        loginMessage = tr.systemLoginRunning || "Waiting for browser login…"
+        Proc.runCommand(
+            "deepseekWidget.settings.login",
+            ["python", _loginScript, "--output", _cookieFile,
+             "--locale", String(pluginData.locale || "en_US")],
+            (stdout, exitCode) => {
+                loginRunning = false
+                _checkCookie()
+                if (exitCode === 0) {
+                    loginMessage = tr.systemLoginSaved || "Credential saved — refresh the widget to load data."
+                } else {
+                    loginMessage = tr.systemLoginFailed || "Login or credential verification failed."
+                }
+            },
+            0,
+            960000
         )
     }
 
@@ -89,17 +114,64 @@ PluginSettings {
         }
     }
 
+    StyledRect {
+        width: parent.width
+        height: loginCol.implicitHeight + Theme.spacingM * 2
+        radius: Theme.cornerRadius
+        color: Theme.surfaceContainerHigh
+
+        Column {
+            id: loginCol
+            anchors { left: parent.left; right: parent.right; top: parent.top; margins: Theme.spacingM }
+            spacing: Theme.spacingS
+
+            StyledText {
+                width: parent.width
+                text: tr.systemLoginTitle || "Log in with your own browser"
+                font.pixelSize: Theme.fontSizeMedium
+                font.weight: Font.Bold
+                color: Theme.surfaceText
+            }
+
+            StyledText {
+                width: parent.width
+                text: tr.systemLoginHint || "Opens your default browser. After logging in, copy the Authorization request header from DevTools and paste it into the secure dialog."
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+                wrapMode: Text.WordWrap
+            }
+
+            DankButton {
+                width: parent.width
+                text: tr.systemLoginButton || "Open browser & import credential"
+                iconName: "open_in_new"
+                enabled: !root.loginRunning
+                onClicked: root._runLogin()
+            }
+
+            StyledText {
+                visible: root.loginMessage !== ""
+                width: parent.width
+                text: root.loginMessage
+                font.pixelSize: Theme.fontSizeSmall
+                color: root.loginMessage === (tr.systemLoginSaved || "Credential saved — refresh the widget to load data.")
+                    ? "#a6e3a1" : Theme.surfaceVariantText
+                wrapMode: Text.WordWrap
+            }
+        }
+    }
+
     SelectionSetting {
         settingKey: "refreshSeconds"
         label: tr.refreshInterval || "Refresh interval"
         description: ""
         options: [
-            { label: tr.min1  || "1 min",  value: "60"   },
             { label: tr.min5  || "5 min",  value: "300"  },
             { label: tr.min15 || "15 min", value: "900"  },
-            { label: tr.min30 || "30 min", value: "1800" }
+            { label: tr.min30 || "30 min", value: "1800" },
+            { label: tr.min60 || "60 min", value: "3600" }
         ]
-        defaultValue: "300"
+        defaultValue: "900"
     }
 
     SelectionSetting {
@@ -123,42 +195,5 @@ PluginSettings {
             { label: tr.langEn || "English", value: "en_US" }
         ]
         defaultValue: "en_US"
-    }
-
-    StyledText {
-        width: parent.width
-        text: tr.prereqTitle || "Prerequisites"
-        font.pixelSize: Theme.fontSizeMedium
-        font.weight: Font.Bold
-        color: Theme.surfaceText
-    }
-
-    StyledRect {
-        width: parent.width
-        height: prereqCol.implicitHeight + Theme.spacingM * 2
-        radius: Theme.cornerRadius
-        color: Theme.surfaceContainer
-
-        Column {
-            id: prereqCol
-            anchors { left: parent.left; right: parent.right; margins: Theme.spacingM; verticalCenter: parent.verticalCenter }
-            spacing: Theme.spacingXS
-
-            Repeater {
-                model: [
-                    "cd ~/.config/DankMaterialShell/plugins/DeepSeekWidget",
-                    "pip install -r scripts/requirements.txt",
-                    "playwright install chromium"
-                ]
-                delegate: StyledText {
-                    width: parent.width
-                    text: (index + 1) + ".  " + modelData
-                    font.pixelSize: Theme.fontSizeSmall
-                    font.family: "monospace"
-                    color: Theme.primary
-                    wrapMode: Text.WrapAnywhere
-                }
-            }
-        }
     }
 }

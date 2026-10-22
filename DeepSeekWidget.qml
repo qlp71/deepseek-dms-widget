@@ -17,6 +17,9 @@ PluginComponent {
     readonly property string _python: "python"
     // Unique command ID per instance to avoid debounce callback collisions
     readonly property string _cmdId: "deepseekWidget_" + Math.random().toString(36).slice(2, 10)
+    // Bump this when the parser/cached data shape changes so historical data
+    // is refreshed once after an upgrade.
+    readonly property int _dataCacheVersion: 2
 
     // ── i18n ──────────────────────────────────────────────────
     property var tr: ({})
@@ -28,7 +31,7 @@ PluginComponent {
             ["cat", path],
             (stdout, exitCode) => {
                 if (exitCode === 0 && stdout.trim()) {
-                    try { tr = JSON.parse(stdout) } catch(e) {}
+                    try { tr = JSON.parse(stdout); _rebuildApiKeyOptions() } catch(e) {}
                 }
             },
             0, 5000
@@ -72,6 +75,9 @@ PluginComponent {
     // API keys + per-key usage (platform "by API key" view)
     // apiKeys: [{trackingId, name, sensitiveId}]
     property var apiKeys: pluginData.apiKeys || []
+    // Selector model derived from apiKeys.  Keeping this as a plain JS array
+    // property lets ComboBox react reliably to later API-key updates.
+    property var apiKeyOptions: []
     // byApiKeyCache: {trackingId: {"2026-7": [daily...], ...}}
     property var byApiKeyCache: pluginData.byApiKeyCache || {}
     // "" = all keys (account aggregate); otherwise a trackingId
@@ -133,6 +139,23 @@ PluginComponent {
         savePluginData({ selectedKeyId: v })
     }
 
+    function _rebuildApiKeyOptions() {
+        const keys = Array.isArray(root.apiKeys) ? root.apiKeys : []
+        const options = [{ text: root.tr.allKeys || "All Keys", value: "", deleted: false }]
+        for (const k of keys) {
+            if (k.valid === false) continue
+            options.push({ text: k.name || k.trackingId, value: k.trackingId, deleted: false })
+        }
+        for (const k of keys) {
+            if (k.valid !== false) continue
+            const name = (k.name || k.trackingId) + "  " + (root.tr.deletedKey || "(deleted)")
+            options.push({ text: name, value: k.trackingId, deleted: true })
+        }
+        root.apiKeyOptions = options
+    }
+
+    onApiKeysChanged: _rebuildApiKeyOptions()
+
     // Daily array of the currently viewed (month, key) combo
     function _getCurrentMonthDaily() {
         const key = _monthKey(root.curYear, root.curMonth)
@@ -157,12 +180,24 @@ PluginComponent {
         return { input: inp, output: out, cost: _fmtCurrency(cost) }
     }
 
-    // Sorted month keys available for the current key selection
+    // Numeric month ordering.  Plain string sort() puts "2026-10" before
+    // "2026-7", which made the current month appear on the far left and put
+    // past months on the right.  Keys are intentionally kept in the existing
+    // un-padded format so cached history remains valid.
+    function _monthOrder(key) {
+        const parts = String(key).split("-")
+        const y = parseInt(parts[0])
+        const m = parseInt(parts[1])
+        if (!isFinite(y) || !isFinite(m)) return 0
+        return y * 12 + m
+    }
+
+    // Sorted month keys available for the current key selection (oldest first)
     function _getMonthKeys() {
-        if (root.selectedKeyId === "") return Object.keys(root.dailyCache).sort()
-        const pk = root.byApiKeyCache[root.selectedKeyId]
-        if (!pk) return []
-        return Object.keys(pk).sort()
+        const keys = root.selectedKeyId === ""
+            ? Object.keys(root.dailyCache)
+            : Object.keys(root.byApiKeyCache[root.selectedKeyId] || {})
+        return keys.sort((a, b) => root._monthOrder(a) - root._monthOrder(b))
     }
 
     // ── Chart data helpers ──────────────────────────────────────
@@ -213,6 +248,24 @@ PluginComponent {
         return viewYear === curYear && viewMonth === curMonth
     }
 
+    // Models with actual usage in the selected month, ordered by total
+    // tokens.  The chart and legend must use the same ordering; taking the
+    // first three entries returned by the API can otherwise select all-zero
+    // placeholder models and hide the models that actually have usage.
+    function _getActiveModels() {
+        const totals = {}
+        for (const d of _getChartData()) {
+            for (const m of (d.models || [])) {
+                const total = (m.inputTokens || 0) + (m.outputTokens || 0)
+                if (total > 0)
+                    totals[m.model] = (totals[m.model] || 0) + total
+            }
+        }
+        return Object.keys(totals)
+            .sort((a, b) => totals[b] - totals[a])
+            .slice(0, 3)
+    }
+
     function _getMonthTotal() {
         const data = _getChartData()
         if (!data || data.length === 0) return "—"
@@ -222,8 +275,9 @@ PluginComponent {
             return _fmtCurrency(total)
         } else {
             for (const d of data) {
-                const models = (d.models || []).filter(m => !m.model.toLowerCase().includes("chat"))
-                for (const m of models) total += (m.inputTokens || 0) + (m.outputTokens || 0)
+                for (const m of (d.models || [])) {
+                    total += (m.inputTokens || 0) + (m.outputTokens || 0)
+                }
             }
             return _fmtTokens(total)
         }
@@ -234,6 +288,11 @@ PluginComponent {
         fetchRunning = false
         let o = null
         try { o = JSON.parse(String(stdout || "").trim()) } catch(e) {}
+
+        // If the user was looking at "this month", follow the calendar when
+        // the month rolls over.  If they had navigated to history, leave the
+        // selected month alone.
+        const wasViewingCurrent = root.viewYear === 0 || root._isCurrentMonth()
 
         if (!o) {
             lastError = (tr.fetchError || "Fetch failed") + (exitCode !== 0 ? " (exit " + exitCode + ")" : "")
@@ -250,6 +309,15 @@ PluginComponent {
         // Network / partial error: keep current status
 
         if (o.error) lastError = o.error
+        else if (o.warning) lastError = o.warning
+        else lastError = ""
+
+        // Never commit a partially fetched snapshot.  Previously a single
+        // transient 429/5xx could overwrite the visible month/cache with zero
+        // or empty values while other endpoints still returned fresh data,
+        // making the card, chart and key selector disagree with each other.
+        // Keep the last known-good snapshot and retry on the next refresh.
+        if (o.ok === false) return
 
         // Balance
         if (o.balance) {
@@ -292,14 +360,16 @@ PluginComponent {
                 cache[key] = o.dailyByMonth[key]
             }
             root.dailyCache = cache
-            savePluginData({ dailyCache: cache, history: root.history })
+            savePluginData({ dailyCache: cache, history: root.history, cacheVersion: root._dataCacheVersion })
         }
 
         // API keys + per-key usage cache (platform "by API key" view)
         // Deleted keys are kept in the list (tagged valid=false) so their
         // historical usage stays visible for cost reconciliation.
+        let apiKeysUpdated = false
         if (o.apiKeys && Array.isArray(o.apiKeys)) {
             root.apiKeys = o.apiKeys
+            apiKeysUpdated = true
         }
         if (o.byApiKey && typeof o.byApiKey === "object") {
             const cache = Object.assign({}, pluginData.byApiKeyCache || {})
@@ -308,6 +378,10 @@ PluginComponent {
             }
             root.byApiKeyCache = cache
             savePluginData({ apiKeys: root.apiKeys, byApiKeyCache: cache, history: root.history })
+        } else if (apiKeysUpdated) {
+            // Persist the key list even when optional by-key usage requests
+            // were throttled; otherwise the selector is empty after restart.
+            savePluginData({ apiKeys: root.apiKeys })
         }
         // Drop the selection only if its key is gone entirely (deleted keys
         // stay selectable so their history can still be inspected)
@@ -319,8 +393,9 @@ PluginComponent {
             }
         }
 
-        // Initialize viewYear/viewMonth from current data
-        if (root.viewYear === 0 && root.curYear > 0) {
+        // Initialize / roll over the chart month.  Keep the current month on
+        // the right end of the chronological navigation range.
+        if (root.curYear > 0 && wasViewingCurrent) {
             root.viewYear = root.curYear
             root.viewMonth = root.curMonth
         }
@@ -337,28 +412,60 @@ PluginComponent {
         return Object.values(map).sort((a, b) => a.year !== b.year ? a.year - b.year : a.month - b.month)
     }
 
+    // Month keys that the configured history range should contain.  Historical
+    // months are immutable, so after they have been cached we only need to
+    // refresh the current month.  Fetching all months and all per-key series
+    // on every 5-minute refresh caused the platform's 429 throttling.
+    function _historyMonthKeys() {
+        const count = Math.max(1, Number(pluginData.historyMonths) || 3)
+        const now = new Date()
+        let y = now.getFullYear()
+        let m = now.getMonth() + 1
+        const keys = []
+        for (let i = 0; i < count; i++) {
+            keys.push(_monthKey(y, m))
+            m -= 1
+            if (m === 0) {
+                m = 12
+                y -= 1
+            }
+        }
+        return keys
+    }
+
+    function _historyCacheComplete() {
+        if (Number(pluginData.cacheVersion || 0) < root._dataCacheVersion) return false
+        for (const key of _historyMonthKeys()) {
+            if (!Array.isArray(root.dailyCache[key])) return false
+        }
+        return true
+    }
+
     // ── Data fetch ────────────────────────────────────────────
     // Every refresh re-runs fetch.py, which always re-fetches the API key list
     // (get_api_keys) plus aggregate and per-key usage, so the key selector is
     // never stale for longer than one refresh cycle.
-    function refreshAll() {
+    function refreshAll(forceHistory) {
         if (fetchRunning) return
         fetchRunning = true
         const months = Number(pluginData.historyMonths) || 3
+        const monthsToFetch = (forceHistory || !_historyCacheComplete()) ? months : 1
         Proc.runCommand(
             _cmdId + ".fetch",
-            [_python, _fetchScript, "--cookie-file", _cookieFile, "--months", String(months)],
+            [_python, _fetchScript, "--cookie-file", _cookieFile, "--months", String(monthsToFetch)],
             (stdout, exitCode) => _parseFetchOutput(stdout, exitCode),
             50,
             120000
         )
     }
 
-    // Refresh when the popout opens, but only if data is older than 60s —
-    // keeps keys (and everything else) current right when the user looks.
+    // Refresh when the popout opens, but never more often than the configured
+    // interval.  The old 60-second stale check could trigger a full request
+    // burst just from opening/closing the popout repeatedly.
     function refreshIfStale() {
         if (root.fetchRunning) return
-        if (Date.now() - root.lastFetchTs < 60000) return
+        const intervalMs = Math.max(300, Number(pluginData.refreshSeconds) || 900) * 1000
+        if (Date.now() - root.lastFetchTs < intervalMs) return
         root.refreshAll()
     }
 
@@ -367,25 +474,27 @@ PluginComponent {
         if (loginRunning) return
         loginRunning = true
         if (typeof ToastService !== "undefined")
-            ToastService.showInfo(tr.loginRunning || "Browser opened…")
+            ToastService.showInfo(tr.systemLoginRunning || "Browser opened — import the Authorization header to continue…")
         Proc.runCommand(
             _cmdId + ".login",
-            [_python, _loginScript, "--output", _cookieFile, "--timeout", "900"],
+            [_python, _loginScript, "--output", _cookieFile,
+             "--locale", String(pluginData.locale || "en_US")],
             (stdout, exitCode) => {
                 loginRunning = false
                 if (exitCode === 2) {
                     if (typeof ToastService !== "undefined")
-                        ToastService.showError("playwright not installed — run: pip install -r scripts/requirements.txt && playwright install chromium")
+                        ToastService.showError(tr.loginDependencyMissing
+                            || "Login dependency missing — install zenity and xdg-open")
                     return
                 }
                 if (exitCode !== 0) {
                     if (typeof ToastService !== "undefined")
-                        ToastService.showError("Login timed out or failed (exit " + exitCode + ")")
+                        ToastService.showError(tr.loginFailed || "Login timed out, was canceled, or the credential was rejected")
                     return
                 }
                 cookieStatus = "ok"
                 if (typeof ToastService !== "undefined")
-                    ToastService.showInfo("Cookie saved — refreshing…")
+                    ToastService.showInfo(tr.loginSaved || "Credential saved — refreshing…")
                 refreshAll()
             },
             0,
@@ -396,7 +505,7 @@ PluginComponent {
     // ── Timer ─────────────────────────────────────────────────
     Timer {
         id: refreshTimer
-        interval: Math.max(60, Number(pluginData.refreshSeconds) || 300) * 1000
+        interval: Math.max(300, Number(pluginData.refreshSeconds) || 900) * 1000
         running: true
         repeat: true
         triggeredOnStart: true
@@ -549,6 +658,26 @@ PluginComponent {
                     }
                 }
 
+                // Fetch error/warning banner
+                StyledRect {
+                    width: parent.width
+                    height: fetchErrorText.implicitHeight + Theme.spacingS * 2
+                    visible: root.lastError !== ""
+                    radius: Theme.cornerRadius
+                    color: Qt.rgba(Theme.error.r, Theme.error.g, Theme.error.b, 0.10)
+                    border.width: 1
+                    border.color: Theme.error
+
+                    StyledText {
+                        id: fetchErrorText
+                        anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; margins: Theme.spacingS }
+                        text: root.lastError
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        color: Theme.error
+                        wrapMode: Text.WordWrap
+                    }
+                }
+
                 // Combined data card
                 StyledRect {
                     width: parent.width
@@ -568,7 +697,7 @@ PluginComponent {
 
                             StyledText {
                                 text: root.curYear > 0
-                                    ? (root.curYear + "-" + (root.curMonth < 10 ? "0" + root.curMonth : root.curMonth) + " UTC" + root._selectedKeySuffix())
+                                    ? (root.curYear + "-" + (root.curMonth < 10 ? "0" + root.curMonth : root.curMonth) + root._selectedKeySuffix())
                                     : "—"
                                 font.pixelSize: Theme.fontSizeSmall
                                 color: Theme.surfaceVariantText
@@ -723,39 +852,23 @@ PluginComponent {
                                     width: parent.width; height: 28
                                     visible: root.apiKeys.length > 0
 
-                                    ListModel { id: keyModel }
-
                                     ComboBox {
                                         id: keySelect
                                         anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter }
                                         height: 28
 
-                                        model: keyModel
+                                        model: root.apiKeyOptions
                                         textRole: "text"
                                         valueRole: "value"
 
-                                        function _rebuildKeyModel() {
-                                            keyModel.clear()
-                                            keyModel.append({ text: root.tr.allKeys || "All Keys", value: "", deleted: false })
-                                            // Active keys first
-                                            for (const k of root.apiKeys) {
-                                                if (k.valid === false) continue
-                                                keyModel.append({ text: k.name || k.trackingId, value: k.trackingId, deleted: false })
+                                        function _syncSelection() {
+                                            for (let i = 0; i < root.apiKeyOptions.length; i++) {
+                                                if (root.apiKeyOptions[i].value === root.selectedKeyId) {
+                                                    currentIndex = i
+                                                    return
+                                                }
                                             }
-                                            // Deleted / invalid keys last, marked
-                                            for (const k of root.apiKeys) {
-                                                if (k.valid !== false) continue
-                                                const n = (k.name || k.trackingId) + "  " + (root.tr.deletedKey || "(deleted)")
-                                                keyModel.append({ text: n, value: k.trackingId, deleted: true })
-                                            }
-                                            keySelect.currentIndex = _indexOfKey(root.selectedKeyId)
-                                        }
-
-                                        function _indexOfKey(id) {
-                                            for (let i = 0; i < keyModel.count; i++) {
-                                                if (keyModel.get(i).value === id) return i
-                                            }
-                                            return 0
+                                            currentIndex = 0
                                         }
 
                                         contentItem: StyledText {
@@ -780,11 +893,12 @@ PluginComponent {
                                             height: 30
                                             highlighted: keySelect.highlightedIndex === index
                                             contentItem: StyledText {
-                                                text: model.text
+                                                readonly property var option: (typeof modelData !== "undefined" && modelData !== null) ? modelData : model
+                                                text: option.text === undefined ? "" : option.text
                                                 color: parent.highlighted ? Theme.primary
-                                                       : (model.deleted ? Theme.surfaceVariantText : Theme.surfaceText)
+                                                       : (option.deleted ? Theme.surfaceVariantText : Theme.surfaceText)
                                                 font.pixelSize: Theme.fontSizeSmall
-                                                font.italic: model.deleted
+                                                font.italic: option.deleted === true
                                                 elide: Text.ElideRight
                                                 verticalAlignment: Text.AlignVCenter
                                                 leftPadding: 8
@@ -814,17 +928,19 @@ PluginComponent {
                                             }
                                         }
 
-                                        Component.onCompleted: _rebuildKeyModel()
+                                        Component.onCompleted: _syncSelection()
 
                                         Connections {
                                             target: root
-                                            function onApiKeysChanged() { _rebuildKeyModel() }
-                                            function onTrChanged() { _rebuildKeyModel() }
+                                            function onApiKeyOptionsChanged() { keySelect._syncSelection() }
+                                            function onApiKeysChanged() { root._rebuildApiKeyOptions(); keySelect._syncSelection() }
+                                            function onSelectedKeyIdChanged() { keySelect._syncSelection() }
+                                            function onTrChanged() { root._rebuildApiKeyOptions(); keySelect._syncSelection() }
                                         }
 
                                         onActivated: {
-                                            const v = keyModel.get(keySelect.currentIndex).value
-                                            root._setSelectedKey(v === undefined ? "" : v)
+                                            const item = root.apiKeyOptions[keySelect.currentIndex]
+                                            root._setSelectedKey(item && item.value !== undefined ? item.value : "")
                                         }
                                     }
                                 }
@@ -942,26 +1058,28 @@ PluginComponent {
                                         ["#22d3bb", "#f97316"],  // model 2: teal + orange (fallback)
                                     ]
 
+                                    const activeModels = root._getActiveModels()
+                                    const numModels = Math.max(1, activeModels.length)
                                     for (let i = 0; i < n; i++) {
                                         const d = data[i]
                                         if (d.day == null) continue
-                                        const models = (d.models || []).filter(m => !m.model.toLowerCase().includes("chat"))
+                                        const models = d.models || []
                                         if (models.length === 0) continue
 
-                                        const numModels = Math.min(models.length, 3)
                                         const groupW = Math.min(gap * 0.8, 30)
                                         const modelW = Math.max(2, groupW / numModels - 2)
                                         const groupX = PAD_L + gap * i + gap / 2 - groupW / 2
 
-                                        for (let mi = 0; mi < numModels; mi++) {
-                                            const m = models[mi]
+                                        for (const m of models) {
+                                            const modelIndex = activeModels.indexOf(m.model)
+                                            if (modelIndex < 0) continue
                                             const inp = m.inputTokens || 0
                                             const out = m.outputTokens || 0
                                             const total = inp + out
                                             if (total === 0) continue
 
-                                            const colors = MODEL_COLORS[mi] || MODEL_COLORS[0]
-                                            const mx = groupX + mi * (modelW + 2)
+                                            const colors = MODEL_COLORS[modelIndex] || MODEL_COLORS[0]
+                                            const mx = groupX + modelIndex * (modelW + 2)
                                             const outH = chartH * (out / maxVal)
                                             const inpH = chartH * (inp / maxVal)
                                             const totalH = outH + inpH
@@ -1008,19 +1126,11 @@ PluginComponent {
                             Repeater {
                                 model: {
                                     const LEGEND_COLORS = [["#5b9bd5", "#a855f7"], ["#38bdf8", "#e879f9"], ["#22d3bb", "#f97316"]]
-                                    const data = root._getChartData()
-                                    if (!data || data.length === 0) return []
-                                    for (const d of data) {
-                                        const models = (d.models || []).filter(m => !m.model.toLowerCase().includes("chat"))
-                                        if (models.length > 0) {
-                                            return models.slice(0, 3).map((m, idx) => ({
-                                                name: m.model.replace(/^deepseek/i, "DS"),
-                                                inColor: (LEGEND_COLORS[idx] || LEGEND_COLORS[0])[0],
-                                                outColor: (LEGEND_COLORS[idx] || LEGEND_COLORS[0])[1],
-                                            }))
-                                        }
-                                    }
-                                    return []
+                                    return root._getActiveModels().map((model, idx) => ({
+                                        name: model.replace(/^deepseek/i, "DS"),
+                                        inColor: (LEGEND_COLORS[idx] || LEGEND_COLORS[0])[0],
+                                        outColor: (LEGEND_COLORS[idx] || LEGEND_COLORS[0])[1],
+                                    }))
                                 }
                                 delegate: Row {
                                     spacing: 4

@@ -6,10 +6,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# Virtual environment
-.venv/
-venv/
-
 # Sensitive user data
 cookie.txt
 .claude
